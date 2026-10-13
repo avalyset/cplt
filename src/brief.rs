@@ -970,6 +970,7 @@ mod tests {
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             gradle_init: false,
+            allow_sysv_ipc: false,
             allow_docker: false,
             // #257 added this after this branch forked; the fixture is a
             // full literal, so every new field lands here.

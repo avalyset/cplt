@@ -258,6 +258,8 @@ pub struct SandboxConfig<'a> {
     pub allow_jvm_attach: bool,
     /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
     pub allow_msbuild: bool,
+    /// Allow System V shared memory and semaphores (macOS only).
+    pub allow_sysv_ipc: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
     pub allow_docker: bool,
     /// Electron app bundle Contents directory (macOS only, ignored on Linux).
@@ -3275,6 +3277,7 @@ mod tests {
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
+            allow_sysv_ipc: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: Agent::Copilot,

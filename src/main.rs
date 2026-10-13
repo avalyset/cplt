@@ -6191,6 +6191,7 @@ fn build_sandbox_config<'a>(
         deny_copilot_dir_exec: resolved.deny_copilot_dir_exec,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
+        allow_sysv_ipc: resolved.allow_sysv_ipc,
         allow_docker: resolved.allow_docker,
         electron_app_dir: session.electron_app_dir,
         agent,

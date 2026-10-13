@@ -176,6 +176,7 @@ pub fn generate_profile_with_playwright_socket_dir(
             .then_some(playwright_socket_dir)
             .flatten(),
     );
+    emit_sysv_ipc(&mut sb, config.allow_sysv_ipc);
     // A temporary HOME puts Copilot's extracted SEA cache under /var/folders.
     // Restore exec only for its pinned, write-denied pkg tree after the broad
     // temp deny; the existing user-deny and write-deny rules still follow.
@@ -2187,6 +2188,25 @@ fn emit_system_files(sb: &mut String) {
     sbpl!(sb);
 }
 
+fn emit_sysv_ipc(sb: &mut String, allow: bool) {
+    if !allow {
+        return;
+    }
+    // Opt-in (`sandbox.allow_sysv_ipc`): embedded Postgres (initdb, test
+    // databases) needs a System V shared-memory interlock segment and SysV
+    // semaphores; no Postgres setting avoids either.
+    //
+    // SECURITY: Seatbelt cannot scope these by key or owner, so this grants
+    // the whole SysV IPC namespace of the user (attach to, or remove, any
+    // segment or semaphore set the user can access), not only ones created
+    // inside the sandbox. Off by default and config-only for that reason.
+    // Linux (Landlock) does not restrict SysV IPC, so this is a no-op there.
+    sbpl!(sb, ";; System V IPC (sandbox.allow_sysv_ipc)");
+    sbpl!(sb, "(allow ipc-sysv-shm)");
+    sbpl!(sb, "(allow ipc-sysv-sem)");
+    sbpl!(sb);
+}
+
 fn emit_temp_rules(
     sb: &mut String,
     allow_tmp_exec: bool,
@@ -3591,6 +3611,19 @@ mod tests {
     /// pnpm's macOS config dir: config.yaml is readable, nothing else in the
     /// dir is (auth.ini/rc hold registry tokens) and nothing is writable.
     #[test]
+    fn profile_sysv_ipc_only_when_enabled() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let off = generate_profile(&opts, &[]);
+        assert!(!off.contains("ipc-sysv"), "SysV IPC granted by default");
+        opts.allow_sysv_ipc = true;
+        let on = generate_profile(&opts, &[]);
+        assert!(on.contains("(allow ipc-sysv-shm)"));
+        assert!(on.contains("(allow ipc-sysv-sem)"));
+    }
+
+    #[test]
     fn profile_grants_pnpm_macos_config_yaml_read_only() {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
@@ -4240,6 +4273,7 @@ mod tests {
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
+            allow_sysv_ipc: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,

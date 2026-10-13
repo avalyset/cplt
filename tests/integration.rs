@@ -499,6 +499,7 @@ mod macos_tests {
             deny_copilot_dir_exec: false,
             allow_jvm_attach: false,
             allow_msbuild: false,
+            allow_sysv_ipc: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: cplt::agent::Agent::Copilot,

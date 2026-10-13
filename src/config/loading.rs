@@ -493,6 +493,9 @@ impl Config {
         // no CLI flag.
         let gradle_init = bools.gradle_init;
 
+        // Config-only opt-in: widens the macOS profile with System V IPC.
+        let allow_sysv_ipc = bools.allow_sysv_ipc;
+
         let deny_nested_git = bools.deny_nested_git;
         let refuse_cache_exec_links = bools.refuse_cache_exec_links;
         let deny_key_files_by_extension = bools.deny_key_files_by_extension;
@@ -679,6 +682,7 @@ impl Config {
             allow_jvm_attach,
             allow_msbuild,
             gradle_init,
+            allow_sysv_ipc,
             deny_nested_git,
             refuse_cache_exec_links,
             deny_key_files_by_extension,
@@ -1976,6 +1980,14 @@ validate = false
         .unwrap();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert_eq!(resolved.git_guard.allow_push.len(), 1);
+    }
+
+    #[test]
+    fn allow_sysv_ipc_defaults_false_and_config_enables() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(!resolved.allow_sysv_ipc);
+        let config: Config = toml::from_str("[sandbox]\nallow_sysv_ipc = true\n").unwrap();
+        assert!(config.merge(CliFlags::default()).unwrap().allow_sysv_ipc);
     }
 
     #[test]
@@ -4153,6 +4165,14 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.gradle_init,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_sysv_ipc",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.allow_sysv_ipc,
                 default: false,
                 preset: None,
             },

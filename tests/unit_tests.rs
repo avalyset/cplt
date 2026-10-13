@@ -840,6 +840,7 @@ fn landlock_policy_device_files_have_ioctl() {
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
+        allow_sysv_ipc: false,
         allow_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
@@ -2718,6 +2719,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
+        allow_sysv_ipc: false,
         allow_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
@@ -4132,6 +4134,7 @@ fn profile_allows_msbuild_when_flag_set() {
     let p = generate_profile(
         &SandboxConfig {
             allow_msbuild: true,
+            allow_sysv_ipc: false,
             ..base_profile_options()
         },
         &[],
@@ -4257,6 +4260,7 @@ fn allow_localhost_any_affects_both_backends() {
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
+        allow_sysv_ipc: false,
         allow_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
@@ -4326,6 +4330,7 @@ fn config_options_parity_across_backends() {
         deny_copilot_dir_exec: false,
         allow_jvm_attach: true,
         allow_msbuild: false,
+        allow_sysv_ipc: false,
         allow_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
@@ -9983,6 +9988,7 @@ yes = false
 allow_jvm_attach = false
 allow_msbuild = false
 gradle_init = false
+allow_sysv_ipc = false
 deny_nested_git = false
 refuse_cache_exec_links = false
 deny_key_files_by_extension = false
@@ -10472,6 +10478,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         deny_copilot_dir_exec: false,
         allow_jvm_attach: false,
         allow_msbuild: false,
+        allow_sysv_ipc: false,
         allow_docker: false,
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,

@@ -391,6 +391,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "allow_sysv_ipc",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "Allow System V shared memory and semaphores (macOS only), e.g. for embedded Postgres (initdb, test databases). Grants the whole SysV IPC namespace, not only segments created inside the sandbox.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "deny_nested_git",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1067,6 +1075,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.gradle_init,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.gradle_init;
+
+    /// Config-only: widens the macOS sandbox with System V IPC, so there is
+    /// deliberately no CLI flag to turn it on for one run.
+    allow_sysv_ipc, "sandbox", "allow_sysv_ipc",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.allow_sysv_ipc,
+        baseline = |_: PresetBaseline| false,
+        resolved = |r: &Resolved| r.allow_sysv_ipc;
 
     /// Config-only and off by default (staged rollout, #576): it breaks
     /// `git worktree add` inside the project.

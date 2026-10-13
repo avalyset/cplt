@@ -672,6 +672,10 @@ pub struct SandboxConfig {
     /// Opt-in: writes to a tool config dir, so it is off unless the
     /// user asks for it.
     pub gradle_init: Option<bool>,
+    /// Allow System V shared memory and semaphores (`ipc-sysv-shm`,
+    /// `ipc-sysv-sem`) inside the sandbox (default: false, macOS only).
+    /// Needed by embedded Postgres (initdb, test databases). Config-only.
+    pub allow_sysv_ipc: Option<bool>,
     /// Deny creating a `.git` entry below a writable root (default: false,
     /// macOS only). See `sandbox_profile::emit_nested_gitdir_denies` (#576).
     pub deny_nested_git: Option<bool>,
@@ -972,6 +976,7 @@ pub struct Resolved {
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
     pub gradle_init: bool,
+    pub allow_sysv_ipc: bool,
     pub deny_nested_git: bool,
     pub refuse_cache_exec_links: bool,
     pub deny_key_files_by_extension: bool,

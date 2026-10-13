@@ -721,6 +721,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
+| `sandbox.allow_sysv_ipc` | grants the user's whole System V IPC namespace (macOS); a repo must not be able to request it |
 | `sandbox.deny_nested_git` | a staged hardening switch, see [Blocking new nested `.git` entries](#blocking-new-nested-git-entries-sandboxdeny_nested_git) |
 | `sandbox.refuse_cache_exec_links` | a staged hardening switch, see [Symlinked cache-exec entries](#symlinked-cache-exec-entries-sandboxrefuse_cache_exec_links) |
 | `sandbox.deny_key_files_by_extension` | a staged hardening switch, see [Denying key files by extension](#denying-key-files-by-extension-sandboxdeny_key_files_by_extension) |

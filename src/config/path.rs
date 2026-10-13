@@ -211,6 +211,13 @@ pub fn default_config_contents() -> String {
 # Enable this if you work with .NET/MSBuild projects.
 # allow_msbuild = false
 #
+# DANGEROUS (macOS only): Allow System V shared memory and semaphores.
+# Needed by embedded Postgres (initdb, test databases), which fails with
+# `shmget` EPERM otherwise. Seatbelt cannot scope SysV IPC, so this grants
+# every segment and semaphore set the user can access, not only ones
+# created inside the sandbox.
+# allow_sysv_ipc = false
+#
 # DANGEROUS: Allow Docker/Colima/OrbStack access inside the sandbox.
 # Exposes ~/.docker config (read-only) and Docker daemon unix sockets.
 # WARNING: Docker container volumes can mount any host path, completely
