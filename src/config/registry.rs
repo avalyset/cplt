@@ -395,7 +395,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
-        description: "Allow System V shared memory and semaphores (macOS only), e.g. for embedded Postgres (initdb, test databases). Grants the whole SysV IPC namespace, not only segments created inside the sandbox.",
+        description: "Allow System V shared memory and semaphores (macOS only), e.g. for embedded Postgres (initdb, test databases). Grants every same-user SysV segment and semaphore set, not only ones created inside the sandbox; other users' objects stay protected.",
     },
     ConfigKeyInfo {
         section: "sandbox",

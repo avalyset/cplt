@@ -2196,14 +2196,24 @@ fn emit_sysv_ipc(sb: &mut String, allow: bool) {
     // databases) needs a System V shared-memory interlock segment and SysV
     // semaphores; no Postgres setting avoids either.
     //
-    // SECURITY: Seatbelt cannot scope these by key or owner, so this grants
-    // the whole SysV IPC namespace of the user (attach to, or remove, any
-    // segment or semaphore set the user can access), not only ones created
-    // inside the sandbox. Off by default and config-only for that reason.
-    // Linux (Landlock) does not restrict SysV IPC, so this is a no-op there.
+    // SECURITY: Seatbelt cannot scope these by key, so this grants every
+    // same-user SysV shared-memory segment and semaphore set (attach, or
+    // remove with IPC_RMID), not only ones created inside the sandbox.
+    // Other users' objects stay protected by the kernel's ipc_perm checks.
+    // SysV message queues (ipc-sysv-msg) are not granted. Off by default and
+    // config-only for that reason. Linux (Landlock) does not restrict SysV
+    // IPC, so this is a no-op there.
     sbpl!(sb, ";; System V IPC (sandbox.allow_sysv_ipc)");
     sbpl!(sb, "(allow ipc-sysv-shm)");
     sbpl!(sb, "(allow ipc-sysv-sem)");
+    // Postgres on macOS also uses POSIX dynamic shared memory
+    // (/PostgreSQL.<n>). Creating it is already allowed; without unlink every
+    // cluster leaks those segments until reboot.
+    // SECURITY: unlink only, and only names with Postgres' own prefix.
+    sbpl!(
+        sb,
+        r#"(allow ipc-posix-shm-write-unlink (ipc-posix-name-regex #"^/PostgreSQL\."))"#
+    );
     sbpl!(sb);
 }
 
@@ -3608,8 +3618,8 @@ mod tests {
         });
     }
 
-    /// pnpm's macOS config dir: config.yaml is readable, nothing else in the
-    /// dir is (auth.ini/rc hold registry tokens) and nothing is writable.
+    /// `sandbox.allow_sysv_ipc` adds the SysV rules and the Postgres-only
+    /// POSIX unlink, and nothing of it is granted by default.
     #[test]
     fn profile_sysv_ipc_only_when_enabled() {
         let project = std::path::Path::new("/projects/app");
@@ -3617,12 +3627,19 @@ mod tests {
         let mut opts = test_options(project, home);
         let off = generate_profile(&opts, &[]);
         assert!(!off.contains("ipc-sysv"), "SysV IPC granted by default");
+        assert!(!off.contains("ipc-posix-shm-write-unlink"));
         opts.allow_sysv_ipc = true;
         let on = generate_profile(&opts, &[]);
         assert!(on.contains("(allow ipc-sysv-shm)"));
         assert!(on.contains("(allow ipc-sysv-sem)"));
+        assert!(on.contains(
+            r#"(allow ipc-posix-shm-write-unlink (ipc-posix-name-regex #"^/PostgreSQL\."))"#
+        ));
+        assert!(!on.contains("ipc-sysv-msg"));
     }
 
+    /// pnpm's macOS config dir: config.yaml is readable, nothing else in the
+    /// dir is (auth.ini/rc hold registry tokens) and nothing is writable.
     #[test]
     fn profile_grants_pnpm_macos_config_yaml_read_only() {
         let project = std::path::Path::new("/projects/app");

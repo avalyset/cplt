@@ -214,7 +214,7 @@ pub fn default_config_contents() -> String {
 # DANGEROUS (macOS only): Allow System V shared memory and semaphores.
 # Needed by embedded Postgres (initdb, test databases), which fails with
 # `shmget` EPERM otherwise. Seatbelt cannot scope SysV IPC, so this grants
-# every segment and semaphore set the user can access, not only ones
+# every same-user segment and semaphore set (other users' stay protected), not only ones
 # created inside the sandbox.
 # allow_sysv_ipc = false
 #

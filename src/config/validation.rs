@@ -294,6 +294,13 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                     .to_string(),
             });
         }
+        if sandbox.get("allow_sysv_ipc").and_then(toml::Value::as_bool) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_sysv_ipc = true lets the agent attach to or remove any of your System V shared-memory segments and semaphores (DANGEROUS)"
+                    .to_string(),
+            });
+        }
         if sandbox.get("allow_docker").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
@@ -494,6 +501,17 @@ quiet = false
                 d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")
             })
         );
+    }
+
+    #[test]
+    fn validate_warns_about_sysv_ipc() {
+        let diagnostics = validate_config("[sandbox]\nallow_sysv_ipc = true\n");
+        assert!(diagnostics.iter().any(|d| {
+            d.level == DiagnosticLevel::Warning
+                && d.message.contains("allow_sysv_ipc")
+                && d.message.contains("DANGEROUS")
+        }));
+        assert!(validate_config("[sandbox]\nallow_sysv_ipc = false\n").is_empty());
     }
 
     #[test]

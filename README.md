@@ -1037,7 +1037,7 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true` |
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |
 | `dotnet build` MSBuild worker nodes blocked | `cplt config set sandbox.allow_msbuild true` |
-| Embedded Postgres (`initdb`, test databases) fails with `shmget` EPERM (macOS) | `cplt config set sandbox.allow_sysv_ipc true` ⚠️ (grants all of the user's System V IPC) |
+| Embedded Postgres (`initdb`, test databases) fails with `shmget` EPERM (macOS) | `cplt config set sandbox.allow_sysv_ipc true` ⚠️ (grants access to all of your own System V shared memory and semaphores) |
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |
 | Internal Maven/Nexus repo unreachable (Gradle/Maven) | `cplt config set proxy.allow_private_domains "intern.example.com"`. An **IP-literal** repository URL cannot be allowed — give the host a DNS name; see below |
 | Playwright Chromium won't launch | Allow cache exec, then disable Chromium's nested sandbox; see below |
