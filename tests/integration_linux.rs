@@ -3626,6 +3626,60 @@ print('CONNECTED')
     }
 
     #[test]
+    fn bwrap_nested_repo_dir_pins_repo_and_intermediate_ancestor_against_rename() {
+        // A nested `--repo-dir` inside the writable project directory must stay
+        // writable for ordinary files while pinning both the nested repository
+        // and any intermediate ancestor directory against rename/unlink so an
+        // agent cannot bypass the `.git` ro-bind mounts by moving the directory.
+        require_bwrap!();
+        let dir = create_deny_project();
+        let project = dir.path().canonicalize().unwrap();
+        assert!(
+            crate::common::git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let inner = project.join("packages/inner");
+        fs::create_dir_all(&inner).unwrap();
+        assert!(
+            crate::common::git_cmd(&inner)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let inner_str = inner.to_string_lossy().into_owned();
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap", "--repo-dir", &inner_str],
+            "sh -c '\
+                echo ok > packages/inner/work.txt && echo WORK-OK || echo WORK-DENIED; \
+                (echo pwn > packages/inner/.git/hooks/pre-commit) 2>/dev/null \
+                    && echo GIT-HOOKS-WRITTEN || echo GIT-HOOKS-DENIED; \
+                (mv packages/inner packages/inner-moved) 2>/dev/null \
+                    && echo INNER-MOVED || echo INNER-PINNED; \
+                (mv packages packages-moved) 2>/dev/null \
+                    && echo ANCESTOR-MOVED || echo ANCESTOR-PINNED'",
+        );
+        assert!(
+            code == 0
+                && stdout.contains("WORK-OK")
+                && stdout.contains("GIT-HOOKS-DENIED")
+                && stdout.contains("INNER-PINNED")
+                && stdout.contains("ANCESTOR-PINNED")
+                && inner.join("work.txt").exists()
+                && !inner.join(".git/hooks/pre-commit").exists()
+                && !project.join("packages/inner-moved").exists()
+                && !project.join("packages-moved").exists(),
+            "code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn bwrap_deny_mask_placeholder_cannot_be_softened() {
         // The placeholder lives inside the writable scratch bind (TMPDIR); a
         // self ro-bind must make chmod through that path fail, or the agent
