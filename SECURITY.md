@@ -1416,6 +1416,17 @@ When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Libr
   - **Ephemeral:** cleaned up on exit via RAII Drop, and stale dirs are GC'd after 24h on startup
 - **On by default:** disable with `--no-scratch-dir` or `sandbox.scratch_dir = false` in config.
 
+#### OpenCode v2 state persistence
+
+An OpenCode v2 session runs with a private `XDG_STATE_HOME`, because the host service's registration (`service.json`) there would attach the sandboxed client to an unsandboxed service. That dir also holds the favorite models, prompt history and TUI state, so `sandbox.persist_agent_state` (default on) copies a fixed allowlist of those files in before launch and back after exit, in the unsandboxed parent (`src/opencode_state.rs`).
+
+- **What crosses:** `model.json`, `prompt-history.jsonl`, `kv.json`, `latest/tui/tabs.json`, `latest/tui/highlights.json`. Nothing else does, so `service.json`, `locks/` and anything OpenCode adds later stay per session.
+- **The agent writes the session copies, so they are hostile input.** They are opened without following symlinks or blocking on a FIFO, size-capped, and parsed against a strict schema (known keys only, scalar types, no control characters, session IDs as `ses_` plus alphanumerics). A file that fails is not copied, and the host file stays as it was.
+- **The host dir is agent-writable too.** The parent refuses a symlink at `opencode/` or below it, writes through a temp file and rename (which replaces a symlink, not follows it), and never writes a file the session left unchanged.
+- **History:** entries are merged, not replaced. New entries must be plain text (no `parts`), so the agent cannot plant a file attachment that the user then recalls with the up arrow.
+- **Residual risk:** the agent can write a misleading prompt, favorite or tab title into those files. It cannot make them execute anything. cplt checks the parent dirs for symlinks just before it writes, not atomically, so a process that outlives the agent could race that check; the audit's settle wait runs first.
+- **Turn it off:** `sandbox.persist_agent_state = false`. The profile and environment are the same either way.
+
 ### Layer 2: CONNECT proxy (logging and domain filtering)
 
 A localhost CONNECT proxy intercepts all outbound traffic by default. cplt injects `HTTP_PROXY`, `HTTPS_PROXY`, and `NODE_USE_ENV_PROXY=1` into the sandbox environment, which routes traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy. Use `--no-proxy` to disable.

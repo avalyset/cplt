@@ -4686,6 +4686,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         );
     }
 
+    let mut agent_state = None;
     if opencode_v2 {
         let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
             bail!(
@@ -4712,6 +4713,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         for w in cplt::opencode_v2::host_warnings(&home_dir) {
             ui::warn(&w);
+        }
+        if resolved.persist_agent_state {
+            let (state, warnings) = cplt::opencode_state::Persist::begin(&home_dir, scratch);
+            for w in warnings {
+                ui::warn(&w);
+            }
+            agent_state = Some(state);
         }
         if let Some(w) = cplt::opencode_v2::first_run_gate(&home_dir) {
             ui::warn(&w);
@@ -4927,6 +4935,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             })
         },
     );
+    // After the agent and its service have exited, before the scratch dir goes.
+    if let Some(state) = agent_state.take() {
+        for w in state.finish() {
+            ui::warn(&w);
+        }
+    }
     if resolved.git_guard.enabled
         && !resolved.quiet
         && let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path)

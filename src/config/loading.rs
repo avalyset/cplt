@@ -532,6 +532,7 @@ impl Config {
         let allow_build_credentials = bools.allow_build_credentials;
 
         let scratch_dir = bools.scratch_dir;
+        let persist_agent_state = bools.persist_agent_state;
 
         // Use-bubblewrap: tri-state. --use-bubblewrap/--no-bubblewrap resolve via
         // FeatureToggle (off wins if both set); otherwise fall through to config,
@@ -695,6 +696,7 @@ impl Config {
             allow_git_worktrees,
             worktree_walk_max_dirs,
             scratch_dir,
+            persist_agent_state,
             use_bubblewrap,
             quiet,
             audit,
@@ -4096,6 +4098,14 @@ mod precedence {
                 cli_on: Some(|c| c.scratch = FeatureToggle::ForceOn),
                 cli_off: Some(|c| c.scratch = FeatureToggle::ForceOff),
                 get: |r| r.scratch_dir,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.persist_agent_state",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.persist_agent_state,
                 default: true,
                 preset: None,
             },

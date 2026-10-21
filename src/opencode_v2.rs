@@ -54,11 +54,16 @@ pub struct Session {
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
 /// spec says, else `$HOME/<default>`.
-fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
+pub(crate) fn xdg_base(var: &str, home: &Path, default: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home.join(default))
+}
+
+/// The session's private `XDG_STATE_HOME`.
+pub(crate) fn session_state(scratch: &Path) -> PathBuf {
+    scratch.join("opencode-v2/state")
 }
 
 /// Set up the session under `scratch` and return its env and profile tail.
@@ -72,7 +77,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| config_base.join("opencode"));
     let config = scratch.join("opencode-v2/config");
-    let state = scratch.join("opencode-v2/state");
+    let state = session_state(scratch);
     std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
     build_overlay(&config_base, &user_oc, &config)
         .map_err(|e| format!("{}: {e}", config.display()))?;

@@ -771,6 +771,10 @@ pub struct SandboxConfig {
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
+    /// Keep an OpenCode v2 session's favorite models, prompt history and TUI
+    /// tabs between runs (default: true). cplt copies an allowlist of validated
+    /// data files out of the host state dir before the run and back after it.
+    pub persist_agent_state: Option<bool>,
     /// Print the post-session project-change and network audit reports (default: true).
     /// After the sandboxed agent exits, cplt diffs the working tree against a
     /// pinned baseline commit (captured before the run) and prints the net
@@ -1030,6 +1034,7 @@ pub struct Resolved {
     /// [`crate::worktrees::DEFAULT_WALK_MAX_DIRS`].
     pub worktree_walk_max_dirs: usize,
     pub scratch_dir: bool,
+    pub persist_agent_state: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,
     /// Print the post-session project-change and network audit reports (default: true).

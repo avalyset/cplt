@@ -786,6 +786,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.yes` | local prompt-skip preference |
 | `sandbox.validate` | local launch behavior |
 | `sandbox.scratch_dir` | local temp handling |
+| `sandbox.persist_agent_state` | decides what is written back into your own OpenCode state dir, which a repo must not control |
 | `sandbox.brief` | local agent-context preference |
 | `sandbox.agents_md` | a repo must not be able to make cplt write into its own `AGENTS.md` |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |

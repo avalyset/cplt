@@ -204,6 +204,10 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("sandbox", "agents_md") => {
             "a repo must not be able to make cplt write into its own AGENTS.md"
         }
+        ("sandbox", "persist_agent_state") => {
+            "decides what is written back into the user's own OpenCode state dir, \
+             which a repo must not control. It is a per-user setting"
+        }
         ("sandbox", "audit") => "controls local CLI output, not project sandbox policy",
         ("sandbox", "use_bubblewrap") => {
             "depends on bwrap being installed locally, not project policy"

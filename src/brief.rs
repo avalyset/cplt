@@ -988,6 +988,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             scratch_dir: true,
+            persist_agent_state: true,
             use_bubblewrap: None,
             quiet: false,
             audit: true,

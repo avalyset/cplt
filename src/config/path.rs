@@ -239,6 +239,12 @@ pub fn default_config_contents() -> String {
 # Cleaned up automatically on exit.
 # scratch_dir = true
 #
+# OpenCode v2 only (default: true). Keep favorite models, prompt history and TUI
+# tabs between runs. cplt copies validated data files from ~/.local/state/opencode
+# into the session's private state dir before launch and back after exit. The
+# background-service registration (service.json) and locks never cross.
+# persist_agent_state = true
+#
 # Print the post-session project-change and network audit reports (default: true). After the
 # sandboxed agent exits, cplt diffs the working tree against a pinned baseline
 # commit captured before the run and prints the net file changes to stderr,

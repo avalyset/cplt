@@ -327,6 +327,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "persist_agent_state",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "OpenCode v2 only: keep favorite models, prompt history and TUI tabs between runs. cplt copies validated data files from the host state dir into the session's private one before launch and back after exit; service.json and locks/ never cross. Needs sandbox.scratch_dir.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "audit",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -1026,6 +1034,14 @@ bool_keys! {
         config = |c: &Config| c.sandbox.scratch_dir,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.scratch_dir;
+
+    /// Config-only: where the user's OpenCode state lives is a local fact,
+    /// and a repo must not decide what flows back into it.
+    persist_agent_state, "sandbox", "persist_agent_state",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.persist_agent_state,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.persist_agent_state;
 
     /// One-way in the OFF direction: `--no-audit` only, no `--audit`.
     audit, "sandbox", "audit",

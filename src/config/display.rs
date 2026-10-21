@@ -734,6 +734,16 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         scratch,
         src("sandbox", "scratch_dir", c.sandbox.scratch_dir.is_some())
     );
+    let persist = c.sandbox.persist_agent_state.unwrap_or(true);
+    println!(
+        "{blue}[cplt]{nc}    persist_agent_state   = {}{}",
+        persist,
+        src(
+            "sandbox",
+            "persist_agent_state",
+            c.sandbox.persist_agent_state.is_some()
+        )
+    );
     let audit = c.sandbox.audit.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    audit                 = {}{}",
