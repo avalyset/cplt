@@ -664,6 +664,7 @@ When your startup command gets long, move the repeated flags into config. Your p
 ```bash
 cplt config set sandbox.allow_localhost_any true  # tools that grab random localhost ports
 cplt config set sandbox.allow_docker true         # Gradle, Testcontainers, Docker
+cplt config set sandbox.allow_rootless_docker true  # Linux: rootless Podman/Docker only
 cplt config set sandbox.allow_jvm_attach true     # Gradle daemon, MockK, Mockito inline mocking
 cplt config set allow.read ~/code/work/.gitconfig-nav  # host files the agent should always read
 ```
@@ -772,7 +773,7 @@ Each toggle resolves in this order: explicit CLI flag, then explicit config valu
 
 ## Global-only settings
 
-Project-specific sandbox permissions belong in `.cplt.toml`, approved with `cplt trust`. That covers `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`, `sandbox.allow_docker`, `sandbox.allow_localhost_any`, and `allow.ports`. Machine-specific paths such as `allow.read ~/code/work/.gitconfig-nav` go in `~/.config/cplt/config.toml`.
+Project-specific sandbox permissions belong in `.cplt.toml`, approved with `cplt trust`. That covers `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`, `sandbox.allow_docker`, `sandbox.allow_rootless_docker`, `sandbox.allow_localhost_any`, and `allow.ports`. Machine-specific paths such as `allow.read ~/code/work/.gitconfig-nav` go in `~/.config/cplt/config.toml`.
 
 `sandbox.pass_env` is the exception among the environment settings: a project can propose the variables its build needs (`NODE_ENV`, `TZ`, `SPRING_PROFILES_ACTIVE`), because it names them one at a time and a reviewer sees the list in the diff. The value still comes from whoever launches the agent, never from the file, and each developer approves once with `cplt trust`. `sandbox.inherit_env` stays refused — it passes the whole environment, so there is nothing for a reviewer to review.
 
@@ -1028,6 +1029,8 @@ Keys not covered in a section above. `cplt config explain <key>` prints the same
 | Key | Default | What it does |
 |---|---|---|
 | `sandbox.allow_env_files` | `false` | Lets the agent read, write and delete `.env*`, `.pem` and `.key` files in the project. See [known impacts](known-impacts.md). |
+| `sandbox.allow_docker` ⚠️ | `false` | Grants the Docker/Podman/Colima/OrbStack daemon sockets and `~/.docker` read-only. Container mounts bypass the sandbox. See [known impacts](known-impacts.md#docker-and-testcontainers). |
+| `sandbox.allow_rootless_docker` ⚠️ | `false` | Linux only. Grants just the rootless sockets under `$XDG_RUNTIME_DIR` (`docker.sock`, `podman/`); rootful sockets stay masked, no `~/.docker`. A rootless container still runs as you, outside the sandbox. `allow_docker` wins if both are set. No effect on macOS. |
 | `sandbox.allow_lifecycle_scripts` ⚠️ | `false` | Lets npm, yarn and pnpm run lifecycle scripts (`postinstall`, `prepare` and so on). |
 | `sandbox.allow_tmp_exec` ⚠️ | `false` | Allows executing binaries from `/tmp` and `/var/folders`. The per-session scratch directory usually covers the same need. |
 | `sandbox.allow_gpg_signing` ⚠️ | `false` | Allows GPG commit and tag signing: read-only access to the public keyring and the GPG agent socket. Private keys stay denied. See [GPG commit signing](known-impacts.md#gpg-commit-signing). |

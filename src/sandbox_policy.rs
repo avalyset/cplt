@@ -697,6 +697,10 @@ pub fn current_uid() -> u32 {
 /// gates it at ABI v9, and *grant `~/.docker` read-only* so the CLI finds its
 /// contexts and registry auth. It grants nothing else.
 ///
+/// `DockerAccess::Rootless` (`--allow-rootless-docker`, #782) lifts only the
+/// rootless entries ([`linux_rootless_socket_paths`]); the rootful daemon
+/// sockets, Docker Desktop and Colima stay masked.
+///
 /// Abstract-namespace sockets have no path and cannot be masked this way; they
 /// are covered (kernel ≥ 6.12 only) by `Scope::AbstractUnixSocket`.
 ///
@@ -707,16 +711,185 @@ pub fn socket_mask_paths(
     home: &Path,
     uid: u32,
     xdg_runtime_dir: Option<&Path>,
-    allow_docker: bool,
+    docker: DockerAccess,
 ) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = linux_runtime_dirs(uid, xdg_runtime_dir)
         .iter()
         .flat_map(|d| [d.join("bus"), d.join("systemd")])
         .collect();
     paths.push(PathBuf::from("/run/dbus/system_bus_socket"));
-    if !allow_docker {
-        paths.extend(linux_docker_socket_paths(home, uid, xdg_runtime_dir));
+    match docker {
+        DockerAccess::Off => paths.extend(linux_docker_socket_paths(home, uid, xdg_runtime_dir)),
+        DockerAccess::Rootless => {
+            let rootless = linux_rootless_socket_paths(home, uid, xdg_runtime_dir);
+            paths.extend(
+                linux_docker_socket_paths(home, uid, xdg_runtime_dir)
+                    .into_iter()
+                    .filter(|p| !rootless.contains(&crate::config::canonicalize_deepest(p))),
+            );
+        }
+        DockerAccess::All => {}
     }
+    paths
+}
+
+/// Which container-runtime sockets the Linux sandbox leaves reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockerAccess {
+    /// Mask every daemon socket (the default).
+    Off,
+    /// `--allow-rootless-docker`: only the sockets under the runtime dirs.
+    Rootless,
+    /// `--allow-docker`: every daemon socket.
+    All,
+}
+
+impl DockerAccess {
+    /// `allow_docker` wins when both keys are set.
+    pub fn from_flags(allow_docker: bool, allow_rootless_docker: bool) -> Self {
+        if allow_docker {
+            Self::All
+        } else if allow_rootless_docker {
+            Self::Rootless
+        } else {
+            Self::Off
+        }
+    }
+}
+
+/// One line naming the container sockets that exist on this host and whether
+/// the agent can reach them, for the launch banner and `cplt doctor` (#782).
+/// `None` when neither docker key is on.
+///
+/// `rootful_blocked` must be true only when something actually takes the
+/// rootful sockets away (active bubblewrap masks, or Landlock ABI v9): below
+/// kernel 7.1 without bubblewrap they stay reachable whatever key is set, and
+/// the line must say so rather than claim a mask that is not there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn container_socket_line(
+    home: &Path,
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+    docker: DockerAccess,
+    blocked: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    let rootless: Vec<PathBuf> = linux_rootless_socket_paths(home, uid, xdg_runtime_dir);
+    let (mut exposed, mut masked, mut open) = (Vec::new(), Vec::new(), Vec::new());
+    for p in linux_docker_socket_paths(home, uid, xdg_runtime_dir) {
+        if !p.exists() {
+            continue;
+        }
+        if rootless.contains(&crate::config::canonicalize_deepest(&p)) {
+            exposed.push(p.display().to_string());
+        } else if blocked(&p) {
+            masked.push(p.display().to_string());
+        } else {
+            open.push(p.display().to_string());
+        }
+    }
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none found".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    match docker {
+        DockerAccess::Off => None,
+        DockerAccess::All => {
+            exposed.extend(masked);
+            exposed.extend(open);
+            Some(format!(
+                "container sockets: all exposed (--allow-docker): {}",
+                list(&exposed)
+            ))
+        }
+        DockerAccess::Rootless => {
+            let mut parts = vec![format!(
+                "container sockets: rootless exposed (runs as you, outside the sandbox): {}",
+                list(&exposed)
+            )];
+            if !masked.is_empty() {
+                parts.push(format!("rootful masked: {}", masked.join(", ")));
+            }
+            if !open.is_empty() {
+                parts.push(format!(
+                    "rootful NOT masked (no bubblewrap mask, Landlock below ABI v9): {}",
+                    open.join(", ")
+                ));
+            }
+            if masked.is_empty() && open.is_empty() {
+                parts.push("rootful: none found".to_string());
+            }
+            Some(parts.join("; "))
+        }
+    }
+}
+
+/// The rootless Docker/Podman endpoints: `docker.sock` and `podman/` in each
+/// runtime dir. Both daemons run as the user, so a container started through
+/// them has the user's rights and no more (#782).
+///
+/// `$XDG_RUNTIME_DIR` comes from the environment, so `XDG_RUNTIME_DIR=/run`
+/// would otherwise make `/run/docker.sock` "rootless". Any entry that equals,
+/// contains or sits under a rootful, Docker Desktop or Colima endpoint is
+/// dropped, compared both lexically (with `..` resolved) and through
+/// symlinks (`/var/run -> /run`). A dropped entry stays masked.
+pub fn linux_rootless_socket_paths(
+    home: &Path,
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let forms = |p: &Path| {
+        let mut lexical = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => lexical.push(c),
+            }
+        }
+        let resolved = crate::config::canonicalize_deepest(&lexical);
+        [lexical, resolved]
+    };
+    let fixed: Vec<PathBuf> = linux_fixed_docker_socket_paths(home, uid)
+        .iter()
+        .flat_map(|p| forms(p))
+        .collect();
+    // Returned resolved, so the Landlock rule (opened with no symlink
+    // following) names a link-free path, and a link swapped in later fails
+    // the launch instead of moving the grant.
+    runtime_dir_socket_paths(uid, xdg_runtime_dir)
+        .into_iter()
+        .filter_map(|r| {
+            let [lexical, resolved] = forms(&r);
+            let overlaps = |r: &PathBuf| fixed.iter().any(|f| r.starts_with(f) || f.starts_with(r));
+            (!overlaps(&lexical) && !overlaps(&resolved)).then_some(resolved)
+        })
+        .collect()
+}
+
+/// `docker.sock` and `podman/` in every runtime dir, unfiltered: the mask list
+/// takes all of them, whatever `$XDG_RUNTIME_DIR` says.
+fn runtime_dir_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    linux_runtime_dirs(uid, xdg_runtime_dir)
+        .iter()
+        .flat_map(|d| [d.join("docker.sock"), d.join("podman")])
+        .collect()
+}
+
+/// The endpoints that never count as rootless: the system daemons, Docker
+/// Desktop and Colima.
+fn linux_fixed_docker_socket_paths(home: &Path, uid: u32) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/run/docker.sock"),
+        PathBuf::from("/var/run/docker.sock"),
+        PathBuf::from("/run/podman"),
+        home.join(".docker").join("desktop").join("docker.sock"),
+    ];
+    paths.extend(colima_socket_paths(home, uid));
     paths
 }
 
@@ -803,11 +976,7 @@ pub fn linux_docker_socket_paths(
         PathBuf::from("/run/docker.sock"),
         PathBuf::from("/var/run/docker.sock"),
     ];
-    paths.extend(
-        linux_runtime_dirs(uid, xdg_runtime_dir)
-            .iter()
-            .flat_map(|d| [d.join("docker.sock"), d.join("podman")]),
-    );
+    paths.extend(runtime_dir_socket_paths(uid, xdg_runtime_dir));
     paths.push(PathBuf::from("/run/podman"));
     paths.push(home.join(".docker").join("desktop").join("docker.sock"));
     paths.extend(colima_socket_paths(home, uid));
@@ -4276,6 +4445,129 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// `--allow-rootless-docker` (#782) lifts the runtime-dir sockets only;
+    /// every rootful, Desktop and colima mask stays. Off and All are unchanged.
+    #[test]
+    fn rootless_docker_lifts_only_the_rootless_masks() {
+        let home = Path::new("/fake/user");
+        let xdg = Path::new("/run/xdg/1000");
+        let masks = |d| socket_mask_paths(home, 1000, Some(xdg), d);
+        let rootless = masks(DockerAccess::Rootless);
+        for kept in [
+            "/run/docker.sock",
+            "/var/run/docker.sock",
+            "/run/podman",
+            "/fake/user/.docker/desktop/docker.sock",
+            "/run/user/1000/bus",
+        ] {
+            assert!(
+                rootless.contains(&PathBuf::from(kept)),
+                "{kept} must stay masked"
+            );
+        }
+        for lifted in linux_rootless_socket_paths(home, 1000, Some(xdg)) {
+            assert!(
+                !rootless.contains(&lifted),
+                "{} must be lifted",
+                lifted.display()
+            );
+        }
+        let off = masks(DockerAccess::Off);
+        let all = masks(DockerAccess::All);
+        assert_eq!(off.len(), rootless.len() + 4);
+        assert_eq!(
+            all.len(),
+            off.len() - linux_docker_socket_paths(home, 1000, Some(xdg)).len()
+        );
+        assert_eq!(DockerAccess::from_flags(true, true), DockerAccess::All);
+        assert_eq!(
+            DockerAccess::from_flags(false, true),
+            DockerAccess::Rootless
+        );
+        assert_eq!(DockerAccess::from_flags(false, false), DockerAccess::Off);
+    }
+
+    /// The banner must not claim rootful sockets are masked when nothing
+    /// masks them (bubblewrap inactive, Landlock below ABI v9).
+    /// A hostile or odd `$XDG_RUNTIME_DIR` must not turn a rootful endpoint
+    /// into a "rootless" one: it stays masked and is never granted.
+    #[test]
+    fn rootless_sockets_never_include_a_rootful_endpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let desktop = home.path().join(".docker/desktop");
+        let fixed = linux_fixed_docker_socket_paths(home.path(), 1000);
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("run");
+        std::os::unix::fs::symlink("/run", &link).unwrap();
+        let mut cases = vec![
+            Path::new("/run"),
+            Path::new("/var/run"),
+            Path::new("/run/user/../"),
+            desktop.as_path(),
+        ];
+        // Through a symlink: only resolvable where /run exists.
+        if Path::new("/run").exists() {
+            cases.push(link.as_path());
+        }
+        for xdg in cases {
+            let rootless = linux_rootless_socket_paths(home.path(), 1000, Some(xdg));
+            for f in &fixed {
+                assert!(!rootless.contains(f), "{xdg:?}: {f:?} granted as rootless");
+            }
+            let masks = socket_mask_paths(home.path(), 1000, Some(xdg), DockerAccess::Rootless);
+            for f in &fixed {
+                assert!(masks.contains(f), "{xdg:?}: {f:?} must stay masked");
+            }
+        }
+    }
+
+    /// `$XDG_RUNTIME_DIR/docker.sock` as a link to a rootful endpoint is not
+    /// rootless: it is dropped from the grant list (review on #784).
+    #[test]
+    fn rootless_socket_linked_to_a_rootful_endpoint_is_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let desktop = home.path().join(".docker/desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::write(desktop.join("docker.sock"), "").unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(desktop.join("docker.sock"), xdg.path().join("docker.sock"))
+            .unwrap();
+        let rootless = linux_rootless_socket_paths(home.path(), 1000, Some(xdg.path()));
+        assert!(
+            !rootless
+                .iter()
+                .any(|p| p.starts_with(xdg.path()) && p.ends_with("docker.sock")
+                    || p.ends_with(".docker/desktop/docker.sock")),
+            "a link to a rootful socket must not be granted: {rootless:?}"
+        );
+        // The podman entry next to it is still rootless, resolved.
+        let podman = crate::config::canonicalize_deepest(&xdg.path().join("podman"));
+        assert!(rootless.contains(&podman), "{rootless:?}");
+    }
+
+    #[test]
+    fn container_socket_line_never_claims_an_absent_mask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let desktop = home.join(".docker/desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::write(desktop.join("docker.sock"), "").unwrap();
+        let line = |d, b: bool| container_socket_line(home, 1000, None, d, &move |_: &Path| b);
+        assert_eq!(line(DockerAccess::Off, true), None);
+        let masked = line(DockerAccess::Rootless, true).unwrap();
+        assert!(
+            masked.contains("rootless exposed") && masked.contains("rootful masked"),
+            "{masked}"
+        );
+        let open = line(DockerAccess::Rootless, false).unwrap();
+        assert!(open.contains("rootful NOT masked"), "{open}");
+        assert!(
+            line(DockerAccess::All, false)
+                .unwrap()
+                .contains("all exposed")
+        );
+    }
+
     #[test]
     fn project_under_a_no_exec_temp_dir_is_named() {
         let p = |s: &str| no_exec_temp_dir_over(Path::new(s), false);
