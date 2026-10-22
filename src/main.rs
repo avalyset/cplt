@@ -6341,13 +6341,30 @@ fn assemble_sandbox(
         resolved.keychain_substitute,
         &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
+    // Doctor's suppression: a token handed over another way makes the keyring moot.
+    let keyring_moot = copilot_stored_token_handover(
+        resolved,
+        keychain_substitute.as_ref(),
+        cplt::sandbox::gh_configured(),
+        cplt::sandbox::copilot_has_native_login(home_dir),
+    );
     if !resolved.quiet
+        && !keyring_moot
         && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
     {
         ui::warn(
             "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
              login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
         );
+    }
+    if !resolved.quiet
+        && !keyring_moot
+        && let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get()
+    {
+        ui::warn(&format!(
+            "Copilot gets no keyring login: {}",
+            skip.reason(home_dir)
+        ));
     }
 
     let mut extra_exec = resolved.allow_exec.clone();
@@ -8541,7 +8558,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         doctor::copilot_own_sandbox_enabled(&home_dir),
         !cplt::sandbox::copilot_sandbox_support_overridden(&resolved.pass_env, active_agent),
     ));
-    findings.extend(doctor::linux_keyring_finding(
+    let keyring = doctor::linux_keyring_finding(
         active_agent,
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
@@ -8556,8 +8573,27 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             auth.gh_cli_auth,
             cplt::sandbox::copilot_has_native_login(&home_dir),
         ),
-        cplt::sandbox::secret_service_skip_reason(resolved.keychain_substitute, &resolved.deny_env),
-    ));
+        &cplt::sandbox::secret_service_skip_reason(
+            resolved.keychain_substitute,
+            &resolved.deny_env,
+            &home_dir,
+        ),
+    );
+    // A recorded skip has one specific fix: lead with it, not a clause in the fix.
+    findings.extend(keyring.map(|mut f| {
+        if let Some(skip) = cplt::sandbox::SECRET_SERVICE_SKIP.get() {
+            f.message = format!(
+                "Copilot's keyring login was not passed to the sandbox. {}",
+                f.message
+            );
+            f.fix = Some(format!(
+                "{}. Or set gh_guard.inject_token = true (with --force), or export a valid \
+                 COPILOT_GITHUB_TOKEN",
+                skip.reason(&home_dir)
+            ));
+        }
+        f
+    }));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
         .chain(repo_under_no_exec_cache_messages(

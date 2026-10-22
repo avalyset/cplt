@@ -1821,7 +1821,13 @@ pub fn keychain_substitute(
             home,
             deny_env,
             keychain_substitute_enabled(agent, setting),
-            || exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable)),
+            || {
+                let hosts = exec::gh_hosts_yml()?;
+                anchored_gh_login(&hosts, writable).unwrap_or_else(|()| {
+                    let _ = SECRET_SERVICE_SKIP.set(SecretServiceSkip::GhHostsWritable(hosts));
+                    None
+                })
+            },
             secret_tool_lookup,
         );
     }
@@ -1835,7 +1841,7 @@ pub fn keychain_substitute(
             // Maintainer call: never switch identity silently. gh signed in as
             // someone other than Copilot's own login keeps the grant (#696).
             if agent == Agent::Copilot {
-                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable));
+                let gh = exec::gh_hosts_yml().and_then(|p| anchored_gh_login(&p, writable).ok()?);
                 if let Some(why) = account_mismatch(
                     gh.as_deref(),
                     copilot_keychain_acct(gh.as_deref()).as_deref(),
@@ -1989,22 +1995,31 @@ fn parse_copilot_config_account(text: &str) -> CopilotConfigAccount {
 /// written it: neither the path as named nor its real path inside a tree in
 /// `writable`. `GH_CONFIG_DIR` or `XDG_CONFIG_HOME` can point gh into a
 /// writable tree, and this login is the anchor that stops the sandboxed agent
-/// from choosing whose stored token cplt reads (#787 review).
-fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Option<String> {
-    // Both the path as named (a link the agent could re-point) and where it
-    // really points. A dotfile-manager link to a tree the agent cannot write
-    // (stow, chezmoi, home-manager) stays usable.
-    let real = std::fs::canonicalize(hosts).ok()?;
+/// from choosing whose stored token cplt reads (#787 review). `Err` is that
+/// refusal; a path that does not resolve gives no login (fail closed). The
+/// path is resolved once, and the check and the read both use that result.
+fn anchored_gh_login(hosts: &Path, writable: &[PathBuf]) -> Result<Option<String>, ()> {
+    let Ok(real) = std::fs::canonicalize(hosts) else {
+        return Ok(None);
+    };
+    if hosts_agent_writable(hosts, &real, writable) {
+        return Err(());
+    }
+    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT);
+    Ok(text.ok().flatten().as_deref().and_then(gh_login))
+}
+
+/// The agent could have written `hosts`: the path as named (a link the agent
+/// could re-point) or `real`, where it resolved, lies in a tree in `writable`.
+/// A dotfile-manager link to a tree the agent cannot write (stow, chezmoi,
+/// home-manager) stays usable.
+fn hosts_agent_writable(hosts: &Path, real: &Path, writable: &[PathBuf]) -> bool {
     let inside = |p: &Path| {
         writable
             .iter()
             .any(|w| p.starts_with(w) || std::fs::canonicalize(w).is_ok_and(|w| p.starts_with(w)))
     };
-    if inside(hosts) || inside(&real) {
-        return None;
-    }
-    let text = crate::untrusted::read_untrusted(&real, COPILOT_CONFIG_LIMIT).ok()??;
-    gh_login(&text)
+    inside(hosts) || inside(real)
 }
 
 /// The github.com `user:` from gh's `hosts.yml`.
@@ -2211,18 +2226,59 @@ pub(crate) fn secret_service_substitute(
     })
 }
 
-/// Why [`secret_service_substitute`] gave no token, for `cplt doctor`. Only
-/// the skips decided before the lookup are told apart; the rest is one bucket.
+/// A Linux keyring skip with a specific fix, recorded where it happens (like
+/// [`SECRET_TOOL_TIMED_OUT`]) so the launch and `cplt doctor` name it without
+/// probing again. Only reached once `~/.copilot/config.json` selects a login
+/// and no token variable is set, so nobody else sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretServiceSkip {
+    /// No `secret-tool` in a trusted bin dir.
+    SecretToolMissing,
+    /// gh's `hosts.yml` (named or real path) is in a tree the agent can write.
+    GhHostsWritable(PathBuf),
+}
+
+impl SecretServiceSkip {
+    /// The reason and its fix, paths in `~/` form.
+    #[must_use]
+    pub fn reason(&self, home: &Path) -> String {
+        match self {
+            Self::SecretToolMissing => "`secret-tool` is not installed in a trusted bin dir; \
+                 install libsecret-tools (e.g. `sudo apt install libsecret-tools`)"
+                .to_string(),
+            Self::GhHostsWritable(p) => format!(
+                "gh's login file {} is in a path the agent can write, so cplt does not trust \
+                 the account it names; move gh's config out of the writable paths",
+                crate::doctor::tilde(p, home)
+            ),
+        }
+    }
+}
+
+/// Set by the first [`SecretServiceSkip`] of this run.
+pub static SECRET_SERVICE_SKIP: std::sync::OnceLock<SecretServiceSkip> = std::sync::OnceLock::new();
+
+/// Why [`secret_service_substitute`] gave no token, for `cplt doctor`. A
+/// recorded [`SECRET_SERVICE_SKIP`] wins; otherwise only the skips decided
+/// before the lookup are told apart and the rest is one bucket.
 #[must_use]
-pub fn secret_service_skip_reason(setting: Option<bool>, deny_env: &[String]) -> &'static str {
+pub fn secret_service_skip_reason(
+    setting: Option<bool>,
+    deny_env: &[String],
+    home: &Path,
+) -> String {
+    if let Some(skip) = SECRET_SERVICE_SKIP.get() {
+        return skip.reason(home);
+    }
     if !keychain_substitute_enabled(Agent::Copilot, setting) {
-        "sandbox.keychain_substitute is off, so no lookup ran"
+        "sandbox.keychain_substitute is off, so no lookup ran".into()
     } else if deny_env.iter().any(|d| d == "COPILOT_GITHUB_TOKEN") {
-        "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran"
+        "deny.env strips COPILOT_GITHUB_TOKEN, so no lookup ran".into()
     } else {
         "no single account in ~/.copilot/config.json matching gh's github.com login (or gh \
          is not logged in), or the `secret-tool` lookup found nothing (not installed in a \
          trusted bin dir, keyring locked, or no stored item)"
+            .into()
     }
 }
 
@@ -2239,7 +2295,10 @@ pub static SECRET_TOOL_TIMED_OUT: std::sync::atomic::AtomicBool =
 /// One `secret-tool lookup` from a trusted bin dir, no shell, 1 s cap. A
 /// locked keyring may wait on an unlock prompt; the cap kills it.
 fn secret_tool_lookup(acct: &str) -> Option<String> {
-    let bin = crate::git::trusted_binary("secret-tool")?;
+    let Some(bin) = crate::git::trusted_binary("secret-tool") else {
+        let _ = SECRET_SERVICE_SKIP.set(SecretServiceSkip::SecretToolMissing);
+        return None;
+    };
     #[allow(clippy::disallowed_methods)] // resolved into a trusted bin root
     let mut cmd = std::process::Command::new(bin);
     cmd.args(secret_tool_args(acct));
@@ -2435,13 +2494,28 @@ fn report_unix_socket_regime(
              container runtimes); any other pathname socket on the host stays reachable."
         ));
     } else {
-        crate::ui::warn(
-            "UNIX sockets are NOT restricted in this run: Landlock cannot gate connect(2) \
-             below ABI v9 (kernel 7.1) and Bubblewrap is not active, so nothing masks them. \
-             An agent can reach the D-Bus session bus or a container daemon socket and \
-             execute code outside the sandbox. Install bubblewrap to close the known paths.",
-        );
+        crate::ui::warn(&unix_sockets_unrestricted(
+            bubblewrap::PROBE_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+        ));
     }
+}
+
+/// The no-bubblewrap socket warning; `probe_failed` means bwrap is installed
+/// but could not create its namespaces, so installing it is not the fix.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unix_sockets_unrestricted(probe_failed: bool) -> String {
+    format!(
+        "UNIX sockets are NOT restricted in this run: Landlock cannot gate connect(2) \
+         below ABI v9 (kernel 7.1) and Bubblewrap is not active, so nothing masks them. \
+         An agent can reach the D-Bus session bus or a container daemon socket and \
+         execute code outside the sandbox. {}",
+        if probe_failed {
+            "Bubblewrap is installed but its probe failed; run `cplt doctor` for the user \
+             namespace / AppArmor fix that closes the known paths."
+        } else {
+            "Install bubblewrap to close the known paths."
+        }
+    )
 }
 
 /// Every path the bubblewrap overlay must re-bind read-only.
@@ -2914,11 +2988,24 @@ fn seed_claude_settings(config: &SandboxConfig) {
 /// Said at launch, or at a spawn-time bwrap fallback, when the `/proc` grant
 /// (#790) is withheld because nothing hides the host's processes.
 #[cfg(target_os = "linux")]
-pub(crate) const PROC_SELF_LIMIT_WARNING: &str = "Without Bubblewrap only the agent's first process can read its own /proc/self \
-     (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
-     fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
-     process's command line. Install bubblewrap, or pass --allow-read /proc if that is \
-     acceptable.";
+pub(crate) fn proc_self_limit_warning() -> String {
+    proc_self_limit_text(bubblewrap::PROBE_FAILED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_self_limit_text(probe_failed: bool) -> String {
+    format!(
+        "Without Bubblewrap only the agent's first process can read its own /proc/self \
+         (cmdline, stat, status); processes it starts get EACCES, so tools such as podman \
+         fail with \"cannot retrieve cmd line\". Granting /proc would expose every host \
+         process's command line. {}, or pass --allow-read /proc if that is acceptable.",
+        if probe_failed {
+            "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix"
+        } else {
+            "Install bubblewrap"
+        }
+    )
+}
 
 #[cfg(target_os = "linux")]
 fn prepare_impl(
@@ -3206,7 +3293,7 @@ fn prepare_impl(
     let dropped = drop_claude_hook_grants(config, &mut policy);
     if bwrap_wrapper.is_none() {
         if proc_dropped {
-            ui::warn(PROC_SELF_LIMIT_WARNING);
+            ui::warn(&proc_self_limit_warning());
         }
         if proc_dropped && dropped.is_empty() {
             profile_text =
@@ -5996,9 +6083,10 @@ mod tests {
 #[cfg(test)]
 mod account_tests {
     use super::{
-        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, account_mismatch, anchored_gh_login,
-        copilot_config_account, copilot_has_native_login, gh_login, keychain_acct,
-        secret_service_substitute, secret_tool_args,
+        COPILOT_CONFIG_LIMIT, CopilotConfigAccount, SecretServiceSkip, account_mismatch,
+        anchored_gh_login, copilot_config_account, copilot_has_native_login, gh_login,
+        hosts_agent_writable, keychain_acct, proc_self_limit_text, secret_service_substitute,
+        secret_tool_args, unix_sockets_unrestricted,
     };
 
     #[test]
@@ -6199,28 +6287,91 @@ mod account_tests {
         std::os::unix::fs::symlink(&good, &link).unwrap();
         let writable = vec![rw.clone()];
         assert_eq!(
-            anchored_gh_login(&good, &writable).as_deref(),
+            anchored_gh_login(&good, &writable).unwrap().as_deref(),
             Some("alice")
         );
         // A dotfile-manager link to a non-writable target is accepted.
         assert_eq!(
-            anchored_gh_login(&link, &writable).as_deref(),
+            anchored_gh_login(&link, &writable).unwrap().as_deref(),
             Some("alice")
         );
         // Inside a writable tree, a link into one, a link placed in one, or
         // missing: no anchor.
-        assert!(anchored_gh_login(&planted, &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&planted, &writable),
+            Ok(Some(_))
+        ));
         let into = ro.join("into.yml");
         std::os::unix::fs::symlink(&planted, &into).unwrap();
-        assert!(anchored_gh_login(&into, &writable).is_none());
+        assert!(!matches!(anchored_gh_login(&into, &writable), Ok(Some(_))));
         let placed = rw.join("placed.yml");
         std::os::unix::fs::symlink(&good, &placed).unwrap();
-        assert!(anchored_gh_login(&placed, &writable).is_none());
-        assert!(anchored_gh_login(&ro.join("nope.yml"), &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&placed, &writable),
+            Ok(Some(_))
+        ));
+        assert!(!matches!(
+            anchored_gh_login(&ro.join("nope.yml"), &writable),
+            Ok(Some(_))
+        ));
         // A symlinked parent into the writable tree is caught via the real path.
         let via = tmp.path().join("via");
         std::os::unix::fs::symlink(&rw, &via).unwrap();
-        assert!(anchored_gh_login(&via.join("hosts.yml"), &writable).is_none());
+        assert!(!matches!(
+            anchored_gh_login(&via.join("hosts.yml"), &writable),
+            Ok(Some(_))
+        ));
+        // The refusals that doctor and launch name, and not a missing file.
+        for p in [&planted, &into, &placed, &via.join("hosts.yml")] {
+            assert_eq!(anchored_gh_login(p, &writable), Err(()), "{}", p.display());
+        }
+        // Resolution failure refuses (no login), without a writable verdict.
+        assert_eq!(anchored_gh_login(&ro.join("nope.yml"), &writable), Ok(None));
+        let dangling = ro.join("dangling.yml");
+        std::os::unix::fs::symlink(ro.join("gone.yml"), &dangling).unwrap();
+        assert_eq!(anchored_gh_login(&dangling, &writable), Ok(None));
+        // The check runs on the real path it is given, not a fresh resolution.
+        assert!(hosts_agent_writable(&good, &planted, &writable));
+        assert!(!hosts_agent_writable(&good, &good, &writable));
+    }
+
+    #[test]
+    fn secret_service_skip_reasons_name_the_fix() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            SecretServiceSkip::SecretToolMissing.reason(home),
+            "`secret-tool` is not installed in a trusted bin dir; install libsecret-tools \
+             (e.g. `sudo apt install libsecret-tools`)"
+        );
+        let hosts = SecretServiceSkip::GhHostsWritable(home.join("proj/.gh/hosts.yml"));
+        assert_eq!(
+            hosts.reason(home),
+            "gh's login file ~/proj/.gh/hosts.yml is in a path the agent can write, so cplt \
+             does not trust the account it names; move gh's config out of the writable paths"
+        );
+    }
+
+    #[test]
+    fn proc_warning_tells_probe_failure_from_missing_bwrap() {
+        assert!(proc_self_limit_text(false).contains("Install bubblewrap, or pass"));
+        let failed = proc_self_limit_text(true);
+        assert!(!failed.contains("Install bubblewrap"));
+        assert!(failed.contains(
+            "Bubblewrap is installed but its probe failed: run `cplt doctor` for the fix, or \
+             pass --allow-read /proc"
+        ));
+    }
+
+    #[test]
+    fn unix_socket_warning_tells_probe_failure_from_missing_bwrap() {
+        let missing = unix_sockets_unrestricted(false);
+        assert!(missing.ends_with("Install bubblewrap to close the known paths."));
+        let failed = unix_sockets_unrestricted(true);
+        assert!(!failed.contains("Install bubblewrap"));
+        assert!(failed.ends_with(
+            "Bubblewrap is installed but its probe failed; run `cplt doctor` for the user \
+             namespace / AppArmor fix that closes the known paths."
+        ));
     }
 
     #[test]
