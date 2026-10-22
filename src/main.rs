@@ -5930,6 +5930,32 @@ fn is_same_file(real: &Path, name: &str) -> bool {
 /// build one by hand and get a deterministic `SandboxConfig` without depending
 /// on whether the machine running it happens to have a JAVA_HOME, a git
 /// checkout, or any particular tool installed.
+/// Every tree the session can write, for refusing a credential anchor the
+/// agent could have planted (`sandbox::keychain_substitute`). Over-including
+/// only falls back to the no-substitute path.
+fn session_writable_everywhere(
+    probe: &HostProbe,
+    repos: &[PathBuf],
+    allow_write: &[PathBuf],
+    agent_dirs: &[agent::AgentDir],
+) -> Vec<PathBuf> {
+    let scratch = scratch::ScratchDir::base(&probe.home_dir);
+    let mut roots =
+        sandbox::session_writable_roots(&probe.project_dir, repos, allow_write, Some(&scratch));
+    roots.extend(cplt::sandbox::home_and_temp_writable_roots(
+        &probe.home_dir,
+        &probe.existing_home_tool_dirs,
+        probe.git_common_dir.as_deref(),
+    ));
+    roots.extend(
+        agent_dirs
+            .iter()
+            .filter(|d| d.write)
+            .map(|d| d.path.clone()),
+    );
+    roots
+}
+
 struct HostProbe {
     home_dir: PathBuf,
     project_dir: PathBuf,
@@ -6298,7 +6324,16 @@ fn assemble_sandbox(
         home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
+        &session_writable_everywhere(probe, opts.repos.dirs, &resolved.allow_write, &agent_dirs),
     );
+    if !resolved.quiet
+        && cplt::sandbox::SECRET_TOOL_TIMED_OUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        ui::warn(
+            "secret-tool did not answer within 1 s (keyring locked?): Copilot gets no keyring \
+             login. Unlock the keyring at login, or set gh_guard.inject_token = true --force",
+        );
+    }
 
     let mut extra_exec = resolved.allow_exec.clone();
     extra_exec.extend(pnpm_exec_grants(
@@ -7299,6 +7334,7 @@ fn run_check_command(
                 &home_dir,
                 &resolved.deny_env,
                 resolved.keychain_substitute,
+                &[],
             )
             .is_some();
         if let Some(nudge) = cplt::sandbox::claude_keychain_nudge(
@@ -8230,6 +8266,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
+        &session_writable_everywhere(&probe, &repo_paths, &resolved.allow_write, &agent_dirs),
     );
     let doctor_pnpm = resolve_exec_binary("pnpm").ok();
     let doctor_pnpm_shadowed = doctor_pnpm
@@ -8493,13 +8530,18 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         active_agent,
         cfg!(target_os = "linux"),
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
-        env_token.is_some(),
+        env_token.is_some()
+            || matches!(
+                keychain_substitute,
+                Some(agent::KeychainSubstitute::SecretService(_))
+            ),
         copilot_stored_token_handover(
             &resolved,
             keychain_substitute.as_ref(),
             auth.gh_cli_auth,
             cplt::sandbox::copilot_has_native_login(&home_dir),
         ),
+        cplt::sandbox::secret_service_skip_reason(resolved.keychain_substitute, &resolved.deny_env),
     ));
     for message in write_granted_repos_messages(&resolved, &project_dir, &repo_paths)
         .into_iter()
@@ -14934,6 +14976,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, true),
+                        ""
                     )
                     .is_some()
                 );
@@ -14950,6 +14993,7 @@ mod tests {
                             true,
                             false,
                             handover,
+                            ""
                         )
                         .is_some()
                     );
@@ -14965,6 +15009,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, false),
+                        ""
                     )
                     .is_none()
                 );
@@ -14979,6 +15024,7 @@ mod tests {
                         true,
                         false,
                         copilot_stored_token_handover(&r, None, true, false),
+                        ""
                     )
                     .is_some()
                 );
