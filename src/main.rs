@@ -2684,7 +2684,13 @@ fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &
     // A hint, not a risk: shown once per set of unlinked repos (output policy).
     // An empty set is recorded too, so a repo that comes back shows again.
     let messages = unlinked_child_repos_messages(project_dir, named_roots);
-    if cplt::launch_state::changed(home_dir, project_dir, "nested", &messages.join("\n")) {
+    // Fingerprint the whole sorted set: the message lists only the first few.
+    let mut set: Vec<String> = unlinked_child_repos(project_dir, named_roots)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    set.sort();
+    if cplt::launch_state::changed(home_dir, project_dir, "nested", &set.join("\n")) {
         for message in messages {
             ui::warn(&message);
         }

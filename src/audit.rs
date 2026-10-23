@@ -964,6 +964,7 @@ pub fn write_network_brief<W: Write>(
     if snapshot.availability != proxy::SnapshotAvailability::Available
         || snapshot.completion != proxy::SnapshotCompletion::Settled
         || snapshot.integrity != proxy::SnapshotIntegrity::default()
+        || snapshot.unretained_observations > 0
     {
         return Ok(false);
     }
