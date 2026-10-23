@@ -10,12 +10,12 @@ use super::spec::Spec;
 use super::{CONFIG_LIMIT, SOCKET_ENV};
 
 /// The clients cplt points at the broker: OpenCode v2 through
-/// [`opencode`] and Copilot CLI through [`copilot`].
+/// [`apply_opencode_overlay`] and Copilot CLI through [`copilot_launch_args`].
 /// Reported by `cplt mcp status`.
 pub(crate) const WIRED_CLIENTS: &[&str] = &["opencode", "copilot"];
 
 /// Does a client entry's command run `spec`'s command?
-pub(crate) fn runs(spec: &Spec, argv: &[&str]) -> bool {
+pub(crate) fn matches_command(spec: &Spec, argv: &[&str]) -> bool {
     let Some((first, rest)) = argv.split_first() else {
         return false;
     };
@@ -76,7 +76,7 @@ pub fn opencode_overlay(
         for c in configs {
             for (v2, map) in [(true, c.pointer("/mcp/servers")), (false, c.get("mcp"))] {
                 for (name, s) in map.and_then(Value::as_object).into_iter().flatten() {
-                    if runs(spec, &str_array(s.get("command"))) {
+                    if matches_command(spec, &str_array(s.get("command"))) {
                         names.push((v2, name.clone()));
                     }
                 }
@@ -157,7 +157,7 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
             .filter(|(_, s)| {
                 let mut argv = vec![s.get("command").and_then(Value::as_str).unwrap_or("")];
                 argv.extend(str_array(s.get("args")));
-                runs(spec, &argv)
+                matches_command(spec, &argv)
             })
             .map(|(n, _)| n)
             .collect();
@@ -196,7 +196,7 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
 /// Point OpenCode v2 at the broker: merge the overlay into the session's
 /// `OPENCODE_CONFIG_CONTENT` (which the GitHub MCP proxy may already have
 /// set), else the host's when it reaches the session.
-pub fn opencode(
+pub fn apply_opencode_overlay(
     env: &mut Vec<(String, String)>,
     home: &Path,
     broker: &Broker,
@@ -230,7 +230,7 @@ pub fn opencode(
 
 /// The Copilot CLI args for the broker, from the user's
 /// `~/.copilot/mcp-config.json`.
-pub fn copilot(home: &Path, broker: &Broker) -> Vec<String> {
+pub fn copilot_launch_args(home: &Path, broker: &Broker) -> Vec<String> {
     let text =
         crate::untrusted::read_untrusted(&home.join(".copilot/mcp-config.json"), CONFIG_LIMIT)
             .ok()

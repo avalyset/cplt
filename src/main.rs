@@ -4840,7 +4840,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     .pass_env
                     .iter()
                     .any(|p| p == "OPENCODE_CONFIG_CONTENT");
-            cplt::mcp_broker::opencode(
+            cplt::mcp_broker::apply_opencode_overlay(
                 &mut session.env,
                 &home_dir,
                 broker,
@@ -5032,7 +5032,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .as_ref()
         .filter(|_| active_agent == agent::Agent::Copilot)
     {
-        copilot_args.extend(cplt::mcp_broker::copilot(&home_dir, broker));
+        copilot_args.extend(cplt::mcp_broker::copilot_launch_args(&home_dir, broker));
     }
 
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.

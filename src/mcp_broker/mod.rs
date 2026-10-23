@@ -58,7 +58,7 @@ mod shim;
 mod spec;
 mod status;
 
-pub use client::{copilot, opencode};
+pub use client::{apply_opencode_overlay, copilot_launch_args};
 pub use runtime::{Broker, Log};
 pub use shim::run_stdio;
 pub use spec::{Detected, Spec, detect, drop_writable, load, spec_dir};
