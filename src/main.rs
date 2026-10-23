@@ -569,6 +569,16 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_brief: bool,
 
+    /// OpenCode v2: route a GitHub MCP entry (api.githubcopilot.com/mcp)
+    /// through a host-side read-only proxy holding your gh login (default on;
+    /// `sandbox.github_mcp_proxy`).
+    #[arg(long, conflicts_with = "no_github_mcp_proxy")]
+    github_mcp_proxy: bool,
+
+    /// Leave OpenCode's GitHub MCP entry as configured for this run.
+    #[arg(long)]
+    no_github_mcp_proxy: bool,
+
     /// EXPERIMENTAL. With --brief, also write the managed cplt block into the
     /// project's AGENTS.md. Off by default, unstable, and may be removed in a
     /// future release. Has no effect without --brief (or `sandbox.brief`).
@@ -2876,6 +2886,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         ),
         no_validate: cli.no_validate,
         brief: config::FeatureToggle::from_pair(cli.brief, cli.no_brief),
+        github_mcp_proxy: config::FeatureToggle::from_pair(
+            cli.github_mcp_proxy,
+            cli.no_github_mcp_proxy,
+        ),
         agents_md: config::FeatureToggle::from_pair(cli.agents_md, cli.no_agents_md),
         pass_env: cli.pass_env.clone(),
         inherit_env: cli.inherit_env,
@@ -4719,6 +4733,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         let mut session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
+        if resolved.github_mcp_proxy {
+            let reaches = |v: &str| {
+                !resolved.deny_env.iter().any(|d| d == v)
+                    && (resolved.inherit_env || resolved.pass_env.iter().any(|p| p == v))
+            };
+            cplt::opencode_v2::github_mcp(
+                &mut session,
+                &home_dir,
+                &resolved.deny_env,
+                reaches,
+                proxy_handle.as_ref().map(|h| h.port),
+                cplt::discover::stored_gh_secret,
+            );
+        }
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
         if let Some((name, _)) = session
