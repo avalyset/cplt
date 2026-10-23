@@ -293,7 +293,9 @@ fn cplt_state_dir_grant_in(env: &CacheEnv, home: &Path, path: &Path) -> Option<P
     let resolved = canon(path);
     config::config_dir()
         .into_iter()
-        .chain(cplt_state_dirs(env, home))
+        .chain(std::iter::once(home.join(CPLT_STATE_DIR)))
+        // The XDG location even when this launch pinned state away from it.
+        .chain(xdg_state_dir(env))
         .find(|dir| resolved.starts_with(canon(dir)) || path.starts_with(dir))
 }
 

@@ -2681,6 +2681,13 @@ fn pin_state_out_of_grants(
     trees.extend(roots.iter().cloned());
     trees.extend(resolved.allow_read.iter().cloned());
     trees.extend(resolved.allow_write.iter().cloned());
+    // Temp dirs and the git common dir are writable with no grant behind them.
+    let common = discover::git_common_dir(home_dir, project_dir, &resolved.allow_write).0;
+    trees.extend(sandbox::home_and_temp_writable_roots(
+        home_dir,
+        &[],
+        common.as_deref(),
+    ));
     trees.extend(
         sandbox::HOME_TOOL_DIRS
             .iter()
