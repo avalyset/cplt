@@ -307,12 +307,7 @@ pub fn github_mcp(
         return false;
     }
     let host_var = |v: &str| reaches(v).then(|| std::env::var_os(v)).flatten();
-    let mut dirs = vec![xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")];
-    dirs.extend(
-        std::env::var_os("OPENCODE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute()),
-    );
+    let dirs = user_config_dirs(home);
     // The host's own OPENCODE_CONFIG never reaches v2: the session sets its
     // own, naming the global file already read from `dirs` (#806).
     let existing = host_var(VAR).and_then(|v| v.into_string().ok());
@@ -347,6 +342,18 @@ pub fn github_mcp(
             false
         }
     }
+}
+
+/// The user's OpenCode config dirs: `$XDG_CONFIG_HOME/opencode`, then an
+/// absolute `OPENCODE_CONFIG_DIR`. Never a project dir.
+pub(crate) fn user_config_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")];
+    dirs.extend(
+        std::env::var_os("OPENCODE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute()),
+    );
+    dirs
 }
 
 /// `overlay` = a link per entry of `user`, except `opencode`, which becomes a

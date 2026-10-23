@@ -114,6 +114,24 @@ pub fn configured_servers(
     config_file: Option<&Path>,
     content: Option<&str>,
 ) -> Vec<Entry> {
+    let mut names: Vec<Entry> = user_configs(dirs, config_file, content)
+        .iter()
+        .flat_map(github_servers)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The user's OpenCode configs, parsed: `config.json`, `opencode.json` and
+/// `opencode.jsonc` in each of `dirs`, then `config_file`, then `content`.
+/// Read as untrusted (no symlinks, size cap); unreadable or invalid ones are
+/// skipped. Project config is never among them.
+pub fn user_configs(
+    dirs: &[PathBuf],
+    config_file: Option<&Path>,
+    content: Option<&str>,
+) -> Vec<Value> {
     let mut files: Vec<PathBuf> = dirs
         .iter()
         .flat_map(|d| ["config.json", "opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
@@ -128,14 +146,10 @@ pub fn configured_servers(
         })
         .collect();
     texts.extend(content.map(str::to_string));
-    let mut names: Vec<Entry> = texts
+    texts
         .iter()
         .filter_map(|t| serde_json::from_str(&crate::agent::strip_jsonc(t)).ok())
-        .flat_map(|v: Value| github_servers(&v))
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+        .collect()
 }
 
 /// Where request lines go: the proxy's log level and `--proxy-log` file.

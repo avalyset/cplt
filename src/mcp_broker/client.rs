@@ -1,7 +1,7 @@
 //! Client wiring: OpenCode and Copilot CLI overlays.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
@@ -32,27 +32,8 @@ pub(crate) fn str_array(v: Option<&Value>) -> Vec<&str> {
 /// The user's OpenCode config files (the same set as
 /// [`crate::github_mcp::configured_servers`]), parsed.
 pub fn opencode_configs(home: &Path, content: Option<&str>) -> Vec<Value> {
-    let mut dirs =
-        vec![crate::opencode_v2::xdg_base("XDG_CONFIG_HOME", home, ".config").join("opencode")];
-    dirs.extend(
-        std::env::var_os("OPENCODE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute()),
-    );
-    let mut texts: Vec<String> = dirs
-        .iter()
-        .flat_map(|d| ["config.json", "opencode.json", "opencode.jsonc"].map(|f| d.join(f)))
-        .filter_map(|f| {
-            crate::untrusted::read_untrusted(&f, CONFIG_LIMIT)
-                .ok()
-                .flatten()
-        })
-        .collect();
-    texts.extend(content.map(str::to_string));
-    texts
-        .iter()
-        .filter_map(|t| serde_json::from_str(&crate::agent::strip_jsonc(t)).ok())
-        .collect()
+    let dirs = crate::opencode_v2::user_config_dirs(home);
+    crate::github_mcp::user_configs(&dirs, None, content)
 }
 
 /// `OPENCODE_CONFIG_CONTENT` with each brokered server's entry pointed at
