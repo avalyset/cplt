@@ -335,7 +335,7 @@ impl PackageManager {
     pub fn upgrade_command(self) -> &'static str {
         match self {
             Self::Homebrew => "brew upgrade navikt/tap/cplt",
-            Self::Apt => "sudo apt upgrade cplt",
+            Self::Apt => "sudo apt update && sudo apt install --only-upgrade cplt",
         }
     }
 }
@@ -1305,7 +1305,7 @@ mod tests {
         );
         assert_eq!(
             PackageManager::Apt.upgrade_command(),
-            "sudo apt upgrade cplt"
+            "sudo apt update && sudo apt install --only-upgrade cplt"
         );
         assert_eq!(PackageManager::Apt.name(), "apt");
     }
