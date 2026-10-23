@@ -880,7 +880,11 @@ fn drop_rootful_overlaps(
     also_rootful: &[PathBuf],
     candidates: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
+    // `resolved` is taken from the raw path, so a `..` after a symlink is
+    // walked the way the kernel walks it; `lexical` catches what a dangling
+    // tail hides from it.
     let forms = |p: &Path| {
+        let resolved = crate::config::canonicalize_deepest(p);
         let mut lexical = PathBuf::new();
         for c in p.components() {
             match c {
@@ -891,11 +895,13 @@ fn drop_rootful_overlaps(
                 c => lexical.push(c),
             }
         }
-        let resolved = crate::config::canonicalize_deepest(&lexical);
         [lexical, resolved]
     };
+    // The Colima dirs themselves, not just their live sockets: a profile
+    // started after launch must not land inside a rootless grant (#785).
     let fixed: Vec<PathBuf> = linux_fixed_docker_socket_paths(home, uid)
         .iter()
+        .chain(&colima_dirs(home))
         .chain(also_rootful)
         .flat_map(|p| forms(p))
         .collect();
@@ -1024,6 +1030,24 @@ pub fn linux_docker_socket_paths(
     paths
 }
 
+/// The colima dirs: `$COLIMA_HOME`, `~/.colima` and `$XDG_CONFIG_HOME/colima`
+/// (default `~/.config/colima`). See [`colima_socket_paths`].
+fn colima_dirs(home: &Path) -> Vec<PathBuf> {
+    let env_dir = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let mut dirs: Vec<PathBuf> = env_dir("COLIMA_HOME").into_iter().collect();
+    dirs.push(home.join(".colima"));
+    dirs.push(
+        env_dir("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home.join(".config"))
+            .join("colima"),
+    );
+    dirs
+}
+
 /// Colima daemon sockets that exist right now, in every profile (#209).
 ///
 /// `colima start --profile foo` serves Docker at `<colima dir>/foo/docker.sock`,
@@ -1055,18 +1079,7 @@ pub fn linux_docker_socket_paths(
 /// literals in the macOS profile still are.
 pub fn colima_socket_paths(home: &Path, uid: u32) -> Vec<PathBuf> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let env_dir = |var: &str| {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-    };
-    let mut dirs: Vec<PathBuf> = env_dir("COLIMA_HOME").into_iter().collect();
-    dirs.push(home.join(".colima"));
-    dirs.push(
-        env_dir("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home.join(".config"))
-            .join("colima"),
-    );
+    let dirs = colima_dirs(home);
 
     // Checked with lstat here and opened later by the sandbox. The window
     // closes before the agent runs, and swapping the file needs write access
@@ -4583,6 +4596,63 @@ mod tests {
             let masks = socket_mask_paths(home.path(), 1000, Some(xdg), DockerAccess::Rootless);
             for f in &fixed {
                 assert!(masks.contains(f), "{xdg:?}: {f:?} must stay masked");
+            }
+        }
+    }
+
+    /// `link/..` names the link target's parent, not the link's: a Colima dir
+    /// spelled that way still drops a rootless entry under it (review on #804).
+    #[test]
+    fn rootful_overlap_follows_a_symlink_before_dotdot() {
+        let home = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
+        std::fs::create_dir_all(base.join("actual/nested")).unwrap();
+        std::fs::create_dir_all(base.join("actual/colima/work")).unwrap();
+        std::os::unix::fs::symlink(base.join("actual/nested"), base.join("link")).unwrap();
+        let spelled = base.join("link/../colima");
+        let xdg = base.join("actual/colima/work");
+        let rootless = temp_env::with_vars(
+            [
+                ("COLIMA_HOME", Some(spelled.as_os_str())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || linux_rootless_socket_paths(home.path(), 1000, Some(&xdg)),
+        );
+        assert!(
+            !rootless.iter().any(|p| p.starts_with(&xdg)),
+            "{rootless:?}"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `$XDG_RUNTIME_DIR` under a Colima dir grants nothing, even before any
+    /// Colima socket exists: a profile started later would land in it (#785).
+    #[test]
+    fn rootless_under_a_colima_dir_without_a_socket_is_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let colima_home = tempfile::tempdir().unwrap();
+        let xdg_config = tempfile::tempdir().unwrap();
+        for dir in [
+            home.path().join(".colima/work"),
+            colima_home.path().join("work"),
+            xdg_config.path().join("colima/work"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            let (rootless, podman) = temp_env::with_vars(
+                [
+                    ("COLIMA_HOME", Some(colima_home.path().as_os_str())),
+                    ("XDG_CONFIG_HOME", Some(xdg_config.path().as_os_str())),
+                ],
+                || {
+                    (
+                        linux_rootless_socket_paths(home.path(), 1000, Some(&dir)),
+                        linux_podman_state_dirs(home.path(), 1000, Some(&dir)),
+                    )
+                },
+            );
+            let resolved = crate::config::canonicalize_deepest(&dir);
+            for p in rootless.iter().chain(&podman) {
+                assert!(!p.starts_with(&resolved), "{dir:?}: {p:?} granted");
             }
         }
     }
