@@ -164,7 +164,10 @@ pub fn drop_writable(found: &mut Detected, writable: impl Fn(&Path) -> Option<Pa
                 let r = Rejected {
                     file: spec.file.display().to_string(),
                     reason: format!("{} is writable in the sandbox", tree.display()),
-                    fix: "move the cplt config dir out of every write grant".into(),
+                    fix: format!(
+                        "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
+                        tree.display()
+                    ),
                 };
                 found.rejected.push(r);
             }
@@ -465,7 +468,6 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
     };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let real_dir = canon(dir);
-    let in_writable = writable.iter().any(|w| real_dir.starts_with(canon(w)));
     let dir_link = dir
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink());
@@ -482,14 +484,49 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let file_writable = writable.iter().any(|w| canon(&path).starts_with(canon(w)));
-        let result = if in_writable || dir_link || file_writable {
-            Err("in a tree the sandbox can write, or behind a symlink".to_string())
+        let tree = writable
+            .iter()
+            .find(|w| real_dir.starts_with(canon(w)) || canon(&path).starts_with(canon(w)));
+        let file_link = path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        // (reason, fix): the fix matches the cause; only a bad spec is
+        // nav-pilot's to rewrite.
+        let result = if dir_link {
+            Err((
+                format!("{} is a symlink", dir.display()),
+                format!(
+                    "replace the symlink {} with a real directory",
+                    dir.display()
+                ),
+            ))
+        } else if let Some(tree) = tree {
+            Err((
+                format!("{} is writable in the sandbox", tree.display()),
+                format!(
+                    "move XDG_CONFIG_HOME (or the spec) out of {}, or drop that write grant",
+                    tree.display()
+                ),
+            ))
+        } else if file_link {
+            Err((
+                "the spec is a symlink".into(),
+                format!(
+                    "replace the symlink {} with the file itself",
+                    path.display()
+                ),
+            ))
         } else {
+            let enable = || {
+                let id = file.trim_end_matches(".json").replace("__", "/");
+                format!("nav-pilot mcp enable {id}")
+            };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
-                Ok(Some(text)) => validate(&text, &file, crate::git::trusted_binary),
-                Ok(None) => Err("a symlink, not a regular file, or too large".into()),
-                Err(e) => Err(format!("cannot read ({e})")),
+                Ok(Some(text)) => {
+                    validate(&text, &file, crate::git::trusted_binary).map_err(|r| (r, enable()))
+                }
+                Ok(None) => Err(("not a regular file, or too large".into(), enable())),
+                Err(e) => Err((format!("cannot read ({e})"), enable())),
             }
         };
         match result {
@@ -499,12 +536,11 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
                 spec.file.clone_from(&path);
                 out.specs.push(spec);
             }
-            Err(reason) => {
-                let id = file.trim_end_matches(".json").replace("__", "/");
+            Err((reason, fix)) => {
                 out.rejected.push(Rejected {
                     file: path.display().to_string(),
                     reason,
-                    fix: format!("nav-pilot mcp enable {id}"),
+                    fix,
                 });
             }
         }
@@ -1994,11 +2030,18 @@ mod tests {
         std::os::unix::fs::symlink(&real, dir.path().join(FILE)).unwrap();
         let found = load(dir.path(), &[], &[]);
         assert!(found.specs.is_empty());
-        assert!(found.rejected.iter().any(|r| r.reason.contains("symlink")));
+        let r = found
+            .rejected
+            .iter()
+            .find(|r| r.reason.contains("symlink"))
+            .unwrap();
+        assert!(r.fix.starts_with("replace the symlink"), "{r:?}");
         std::fs::remove_file(dir.path().join(FILE)).unwrap();
         std::fs::rename(&real, dir.path().join(FILE)).unwrap();
         let found = load(dir.path(), &[dir.path().to_path_buf()], &[]);
-        assert!(found.specs.is_empty() && found.rejected[0].reason.contains("can write"));
+        assert!(
+            found.specs.is_empty() && found.rejected[0].reason.contains("writable in the sandbox")
+        );
         assert!(
             load(&dir.path().join("missing"), &[], &[])
                 .rejected
@@ -2336,7 +2379,9 @@ mod tests {
         let none = with(base(), "/credential", json!("none"));
         std::fs::write(&f, spec_json(with(none, "/command", json!(["sh"])))).unwrap();
         let found = load(dir.path(), std::slice::from_ref(&f), &[]);
-        assert!(found.specs.is_empty() && found.rejected[0].reason.contains("can write"));
+        assert!(
+            found.specs.is_empty() && found.rejected[0].reason.contains("writable in the sandbox")
+        );
         let mut found = load(dir.path(), &[], &[]);
         assert_eq!(found.specs.len(), 1);
         assert_eq!(found.specs[0].file, f);
@@ -2491,5 +2536,36 @@ mod tests {
             json!(["cplt", "mcp-stdio", "io.github.nais/nais-mcp"])
         );
         assert_eq!(out, existing, "everything else unchanged");
+    }
+
+    #[test]
+    fn the_fix_matches_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = with(base(), "/credential", json!("none"));
+        std::fs::write(
+            dir.path().join(FILE),
+            spec_json(with(none, "/command", json!(["sh"]))),
+        )
+        .unwrap();
+        let r = &load(dir.path(), &[dir.path().to_path_buf()], &[]).rejected[0];
+        assert!(r.fix.starts_with("move XDG_CONFIG_HOME"), "{r:?}");
+        assert!(
+            r.fix
+                .contains(&*std::fs::canonicalize(dir.path()).unwrap().to_string_lossy())
+                || r.fix.contains(&*dir.path().to_string_lossy()),
+            "names the tree: {r:?}"
+        );
+        let link = tempfile::tempdir().unwrap();
+        let ln = link.path().join("mcp");
+        std::os::unix::fs::symlink(dir.path(), &ln).unwrap();
+        let r = &load(&ln, &[], &[]).rejected[0];
+        assert!(
+            r.fix.starts_with("replace the symlink") && r.fix.contains("real directory"),
+            "{r:?}"
+        );
+        // A bad spec is still nav-pilot's to rewrite.
+        std::fs::write(dir.path().join(FILE), "{").unwrap();
+        let r = &load(dir.path(), &[], &[]).rejected[0];
+        assert_eq!(r.fix, "nav-pilot mcp enable io.github.nais/nais-mcp");
     }
 }
