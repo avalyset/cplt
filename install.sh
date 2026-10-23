@@ -62,7 +62,7 @@ if [[ "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v
   echo "  cplt --shell-install      # Make 'copilot' use the sandboxed version"
   echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"
   echo ""
-  echo "Upgrade later with: brew upgrade cplt"
+  echo "Upgrade later with: brew upgrade navikt/tap/cplt"
   exit 0
 fi
 
@@ -71,21 +71,41 @@ fi
 # install from it. An existing script install outside /usr/bin keeps the direct
 # download: switching it to apt would leave two copies on PATH.
 
+# Any failure here removes the list it wrote and falls through to the direct
+# download, so a broken step never leaves a dead apt source behind.
+apt_install() {
+  local keyring=/usr/share/keyrings/navikt-archive-keyring.gpg
+  local list=/etc/apt/sources.list.d/navikt.list
+  local key_tmp
+  key_tmp="$(mktemp)"
+  curl -fsSL -o "$key_tmp" https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg \
+    && test -s "$key_tmp" \
+    && sudo install -m 644 "$key_tmp" "$keyring" \
+    && echo "deb [signed-by=${keyring}] https://navikt.github.io/apt stable main" \
+      | sudo tee "$list" >/dev/null \
+    && sudo apt-get update -qq -o Dir::Etc::sourcelist="$list" \
+      -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 </dev/null \
+    && sudo apt-get install -y cplt </dev/null
+  local rc=$?
+  rm -f "$key_tmp"
+  if [[ $rc -ne 0 ]]; then
+    sudo rm -f "$list" 2>/dev/null || true
+    echo "! apt install failed, falling back to direct download (--no-apt skips apt)"
+  fi
+  return $rc
+}
+
 EXISTING="$(command -v "$BINARY" 2>/dev/null || true)"
+DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+# sudo must work without asking, or have a terminal to ask on: under curl | bash
+# stdin is the script, not the user.
 if [[ "$NO_APT" == false && -z "$VERSION" && -z "$INSTALL_DIR" && "$(uname -s)" == Linux ]] \
+  && [[ "$DEB_ARCH" == amd64 || "$DEB_ARCH" == arm64 ]] \
   && command -v apt-get &>/dev/null && command -v sudo &>/dev/null \
-  && [[ -z "$EXISTING" || "$EXISTING" == /usr/bin/cplt ]]; then
-  KEYRING=/usr/share/keyrings/navikt-archive-keyring.gpg
-  echo "→ Adding the Nav apt archive (https://navikt.github.io/apt)..."
-  KEY_TMP="$(mktemp)"
-  curl -fsSL -o "$KEY_TMP" https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg
-  test -s "$KEY_TMP"
-  sudo install -m 644 "$KEY_TMP" "$KEYRING"
-  rm -f "$KEY_TMP"
-  echo "deb [signed-by=${KEYRING}] https://navikt.github.io/apt stable main" \
-    | sudo tee /etc/apt/sources.list.d/navikt.list >/dev/null
-  sudo apt-get update -qq
-  sudo apt-get install -y cplt
+  && { sudo -n true 2>/dev/null || [[ -r /dev/tty ]]; } \
+  && [[ -z "$EXISTING" || "$EXISTING" == /usr/bin/cplt ]] \
+  && echo "→ Adding the Nav apt archive (https://navikt.github.io/apt)..." \
+  && apt_install; then
   echo ""
   echo "✓ cplt is ready! ($(cplt --version 2>/dev/null || echo unknown))"
   echo ""
