@@ -286,6 +286,14 @@ struct Cli {
     #[arg(long = "deny-path", value_name = "PATH")]
     deny_paths: Vec<PathBuf>,
 
+    /// Strip an environment variable from the sandbox, even if `--pass-env`
+    /// or `--inherit-env` would let it through. Same effect as `deny.env` in
+    /// `.cplt.toml`. Launchers use it to keep provider keys from an agent,
+    /// e.g. nav-pilot strips OpenCode's voice keys (#814).
+    /// Can be specified multiple times.
+    #[arg(long = "deny-env", value_name = "VAR")]
+    deny_env: Vec<String>,
+
     /// Allow outbound TCP to an additional port beyond 443.
     /// Use for external services the agent needs to reach.
     /// Can be specified multiple times.
@@ -2924,6 +2932,11 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
+    // `.cplt.toml`'s deny.env extends this list later; dedup here too for
+    // launches without one.
+    resolved.deny_env.extend(cli.deny_env.iter().cloned());
+    resolved.deny_env.sort_unstable();
+    resolved.deny_env.dedup();
     let configured_quiet = resolved.quiet;
     if cli.doctor {
         resolved.quiet = true;
@@ -13202,6 +13215,23 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["cplt", "--agent", "claude", "doctor"]).unwrap();
         assert_eq!(cli.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn deny_env_flag_is_repeatable_and_empty_by_default() {
+        let cli = Cli::try_parse_from([
+            "cplt",
+            "--agent",
+            "opencode",
+            "--deny-env",
+            "OPENAI_API_KEY",
+            "--deny-env",
+            "XAI_API_KEY",
+        ])
+        .unwrap();
+        assert_eq!(cli.deny_env, ["OPENAI_API_KEY", "XAI_API_KEY"]);
+        let cli = Cli::try_parse_from(["cplt", "--agent", "opencode"]).unwrap();
+        assert!(cli.deny_env.is_empty());
     }
 
     #[test]

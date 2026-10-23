@@ -1480,7 +1480,7 @@ impl Resolved {
         );
         if !self.deny_env.is_empty() {
             eprintln!(
-                "{blue}[cplt]{nc}    Repo deny:     {dim}{}{nc}",
+                "{blue}[cplt]{nc}    Denied env:    {dim}{}{nc}",
                 self.deny_env.join(", ")
             );
         }
