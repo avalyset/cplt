@@ -15,7 +15,7 @@ pub struct Spec {
     pub id: String,
     /// The spec file it was read from (set by [`load`]).
     pub file: PathBuf,
-    pub credential: Credential,
+    pub credential: &'static Credential,
     /// `command` as written, for finding the user's own client entry.
     pub command: Vec<String>,
     /// `command[0]` resolved in the trusted dirs.
@@ -216,12 +216,12 @@ pub fn validate(
     if ext.command.is_empty() {
         return Err("no command".into());
     }
-    if let Some(fixed) = credential.command()
+    if let Some(fixed) = credential.command
         && ext.command != fixed
     {
         return Err(format!(
             "credential {} runs only `{}`",
-            credential.name(),
+            credential.name,
             fixed.join(" ")
         ));
     }

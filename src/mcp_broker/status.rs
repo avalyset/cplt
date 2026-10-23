@@ -22,7 +22,7 @@ pub fn status_json(found: &Detected, enabled: bool, probe: bool) -> Value {
                 "credential": s.credential,
                 "credential_ok": if probe { credential_ok(s) } else { None },
                 "tools_allowed": s.allow.len(),
-                "clients": ["opencode", "copilot"],
+                "clients": super::client::WIRED_CLIENTS,
             })
         })
         .collect();

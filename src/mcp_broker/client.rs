@@ -9,6 +9,11 @@ use super::runtime::Broker;
 use super::spec::Spec;
 use super::{CONFIG_LIMIT, SOCKET_ENV};
 
+/// The clients cplt points at the broker: OpenCode v2 through
+/// [`opencode`] and Copilot CLI through [`copilot`].
+/// Reported by `cplt mcp status`.
+pub(crate) const WIRED_CLIENTS: &[&str] = &["opencode", "copilot"];
+
 /// Does a client entry's command run `spec`'s command?
 pub(crate) fn runs(spec: &Spec, argv: &[&str]) -> bool {
     let Some((first, rest)) = argv.split_first() else {

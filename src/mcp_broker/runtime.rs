@@ -51,8 +51,9 @@ pub(crate) struct Server {
     /// The live child, if a client is connected. One per server.
     child: Mutex<Option<Arc<Mutex<Child>>>>,
     spawns: Mutex<VecDeque<Instant>>,
-    /// This server's own CONNECT proxy, allowing only its `egressHosts`.
-    egress_port: u16,
+    /// This server's own CONNECT proxy, allowing only its `egressHosts`;
+    /// `None` when it has none, so there is nothing to listen for.
+    egress_port: Option<u16>,
 }
 
 pub(crate) struct Shared {
@@ -116,11 +117,16 @@ impl Broker {
         let mut egress = Vec::new();
         let mut servers = BTreeMap::new();
         for spec in specs {
-            let l = std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|l| l.set_nonblocking(true).map(|()| l))
-                .map_err(|e| format!("cannot start the egress proxy: {e}"))?;
-            let egress_port = l.local_addr().map_err(|e| e.to_string())?.port();
-            egress.push((spec.id.clone(), l));
+            let egress_port = if spec.egress_hosts.is_empty() {
+                None
+            } else {
+                let l = std::net::TcpListener::bind("127.0.0.1:0")
+                    .and_then(|l| l.set_nonblocking(true).map(|()| l))
+                    .map_err(|e| format!("cannot start the egress proxy: {e}"))?;
+                let port = l.local_addr().map_err(|e| e.to_string())?.port();
+                egress.push((spec.id.clone(), l));
+                Some(port)
+            };
             let server = Server {
                 spec,
                 child: Mutex::new(None),
@@ -263,7 +269,9 @@ pub(crate) fn write_line(w: &Mutex<impl Write>, line: &str) -> bool {
 
 pub(crate) fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<Child> {
     let spec = &server.spec;
-    let proxy = format!("http://127.0.0.1:{}", server.egress_port);
+    // No egress hosts, no listener: port 0 cannot be connected to, so every
+    // proxied request fails at once instead of going out direct.
+    let proxy = format!("http://127.0.0.1:{}", server.egress_port.unwrap_or(0));
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.command[1..])
@@ -569,7 +577,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn sh_broker(script: &str) -> Broker {
+        sh_broker_with(script, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sh_broker_with(script: &str, egress: bool) -> Broker {
         let mut spec = check(base()).unwrap();
+        if !egress {
+            spec.egress_hosts.clear();
+        }
         spec.command = vec!["sh".into(), "-c".into(), script.into()];
         spec.program = "/bin/sh".into();
         Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
@@ -611,5 +627,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_egress_hosts_no_listener() {
+        let script = r#"read l; printf '{"jsonrpc":"2.0","id":1,"result":{"p":"%s"}}\n' "$HTTPS_PROXY"; cat >/dev/null"#;
+        for (egress, port0) in [(false, true), (true, false)] {
+            let b = sh_broker_with(script, egress);
+            let server = &b.shared.servers["io.github.nais/nais-mcp"];
+            assert_eq!(server.egress_port.is_none(), port0);
+            let (mut a, mut ra) = connect(&b);
+            writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+            let mut l = String::new();
+            ra.read_line(&mut l).unwrap();
+            assert_eq!(l.contains("127.0.0.1:0\""), port0, "{l}");
+        }
     }
 }
