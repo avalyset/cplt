@@ -3302,7 +3302,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
         for key in &unapproved_proposals {
-            match repo_config::propose_key_detail(&repo_propose, key, Some(5)) {
+            // Act-now, but short: the values are behind --verbose and `cplt trust`.
+            let detail = repo_config::propose_key_detail(&repo_propose, key, Some(5))
+                .filter(|_| ui::verbose());
+            match detail {
                 Some(detail) => eprintln!(
                     "  {}○{} {key}: {detail}",
                     ui::color(ui::YELLOW),
@@ -3312,7 +3315,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
         }
         eprintln!(
-            "  {}Approve:{} cplt trust accept --all  (or select specific keys)",
+            "  {}Approve:{} cplt trust accept --all",
             ui::color(ui::DIM),
             ui::color(ui::RESET),
         );
