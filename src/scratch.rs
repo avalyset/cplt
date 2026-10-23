@@ -733,8 +733,7 @@ fn gc_stale_session_dirs(base: &Path) {
                 continue;
             }
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-            make_subdirs_removable(&path);
-            if let Err(e) = std::fs::remove_dir_all(&path) {
+            if let Err(e) = remove_tree(&path) {
                 ui::warn(&format!(
                     "Warning: cannot remove stale scratch dir {}: {e}",
                     path.display()
@@ -1056,8 +1055,7 @@ fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, labe
         return;
     }
     drop(dir_file);
-    make_subdirs_removable(path);
-    if let Err(error) = std::fs::remove_dir_all(path) {
+    if let Err(error) = remove_tree(path) {
         ui::warn(&format!(
             "Warning: cannot cleanup {label} {}: {error}",
             path.display()
@@ -1065,26 +1063,35 @@ fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, labe
     }
 }
 
-/// Give the owner rwx on every real directory below `dir`, so
-/// `remove_dir_all` can unlink their entries. Tools run in the sandbox (Go's
-/// module cache, for one) leave read-only dirs behind. Never follows
-/// symlinks: only entries whose own `lstat` says directory are touched.
+/// `remove_dir_all`, retrying once after giving the owner rwx on every real
+/// directory below `dir`. Tools run in the sandbox (Go's module cache, for
+/// one) leave read-only dirs behind. The walk only runs on EACCES, so a
+/// large `node_modules` costs no extra chmods in the common case.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_subdirs_removable(dir);
+            std::fs::remove_dir_all(dir)
+        }
+        other => other,
+    }
+}
+
+/// Never follows symlinks: each dir is opened `O_NOFOLLOW|O_DIRECTORY` and
+/// chmodded through that descriptor, so a swapped-in symlink is skipped.
 fn make_subdirs_removable(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        // DirEntry::file_type does not follow symlinks.
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
         let path = entry.path();
-        if let Ok(meta) = path.symlink_metadata()
-            && meta.is_dir()
-        {
+        let Ok(file) = open_dir_nofollow(&path) else {
+            continue;
+        };
+        if let Ok(meta) = file.metadata() {
             let mode = meta.permissions().mode() | 0o700;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
             make_subdirs_removable(&path);
         }
     }
