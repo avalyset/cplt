@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,8 @@ impl Credential {
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub id: String,
+    /// The spec file it was read from (set by [`load`]).
+    pub file: PathBuf,
     pub credential: Credential,
     /// `command` as written, for finding the user's own client entry.
     pub command: Vec<String>,
@@ -134,6 +136,41 @@ pub struct Rejected {
     pub file: String,
     pub reason: String,
     pub fix: String,
+}
+
+impl Rejected {
+    /// For a terminal: every field escaped, since a file name in a spec dir
+    /// the agent could reach may carry control sequences.
+    pub fn line(&self) -> String {
+        let e = |s: &str| s.escape_debug().to_string();
+        format!(
+            "{}: broker spec rejected: {}. Fix: {}",
+            e(&self.file),
+            e(&self.reason),
+            e(&self.fix)
+        )
+    }
+}
+
+/// Drop every spec whose file, or any entry on the way to it, the final
+/// sandbox policy makes writable (`writable` asks the policy about one
+/// path). Returns the newly rejected, already printed.
+pub fn drop_writable(found: &mut Detected, writable: impl Fn(&Path) -> Option<PathBuf>) {
+    let mut kept = Vec::new();
+    for spec in std::mem::take(&mut found.specs) {
+        match writable(&spec.file) {
+            None => kept.push(spec),
+            Some(tree) => {
+                let r = Rejected {
+                    file: spec.file.display().to_string(),
+                    reason: format!("{} is writable in the sandbox", tree.display()),
+                    fix: "move the cplt config dir out of every write grant".into(),
+                };
+                found.rejected.push(r);
+            }
+        }
+    }
+    found.specs = kept;
 }
 
 #[derive(Deserialize)]
@@ -334,6 +371,7 @@ pub fn validate(
     }
     Ok(Spec {
         id,
+        file: PathBuf::new(),
         credential,
         command: ext.command,
         program,
@@ -444,7 +482,8 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let result = if in_writable || dir_link {
+        let file_writable = writable.iter().any(|w| canon(&path).starts_with(canon(w)));
+        let result = if in_writable || dir_link || file_writable {
             Err("in a tree the sandbox can write, or behind a symlink".to_string())
         } else {
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
@@ -456,7 +495,10 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
         match result {
             Ok(spec) if disabled.contains(&spec.id) => out.disabled.push(spec.id),
             Ok(spec) if !seen.insert(spec.id.clone()) => {}
-            Ok(spec) => out.specs.push(spec),
+            Ok(mut spec) => {
+                spec.file.clone_from(&path);
+                out.specs.push(spec);
+            }
             Err(reason) => {
                 let id = file.trim_end_matches(".json").replace("__", "/");
                 out.rejected.push(Rejected {
@@ -475,10 +517,7 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
 pub fn detect(home: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
     let mut found = load(&spec_dir(home), writable, disabled);
     for r in &found.rejected {
-        crate::ui::warn(&format!(
-            "{}: broker spec rejected: {}. Fix: {}",
-            r.file, r.reason, r.fix
-        ));
+        crate::ui::warn(&r.line());
     }
     if !cfg!(target_os = "macos") && !found.specs.is_empty() {
         crate::ui::warn(&format!(
@@ -736,6 +775,19 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     let Some(obj) = msg.as_object() else {
         return Action::Reply(error_line(&Value::Null, -32600, "invalid request"), None);
     };
+    if let Err(key) = unambiguous(&msg) {
+        return Action::Reply(
+            error_line(
+                obj.get("id").unwrap_or(&Value::Null),
+                -32600,
+                "cplt: ambiguous field name",
+            ),
+            Some(format!(
+                "→ DENIED ambiguous key {:?}",
+                key.escape_debug().to_string()
+            )),
+        );
+    }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         // A response to a server request; those are not delivered (D13), so
         // there is nothing for it to answer.
@@ -824,6 +876,45 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     Action::Forward(msg.to_string())
 }
 
+/// Go's `encoding/json` (nais) matches struct fields case-insensitively,
+/// with Unicode folding, so `"Name"` or `"nameſ"`-style keys would be read as
+/// a field this broker checked under its exact spelling. In the envelope,
+/// `params` and `params.arguments`, refuse two keys that fold together, and
+/// any key that folds to a checked field without being spelt exactly so.
+fn unambiguous(msg: &Value) -> Result<(), String> {
+    const CHECKED: &[&str] = &[
+        "jsonrpc",
+        "id",
+        "method",
+        "params",
+        "name",
+        "arguments",
+        "query",
+        "protocolVersion",
+    ];
+    let fold = |k: &str| -> String {
+        k.chars()
+            .flat_map(char::to_lowercase)
+            .map(|c| if c == '\u{17f}' { 's' } else { c })
+            .collect()
+    };
+    let objects = [
+        msg.as_object(),
+        msg.get("params").and_then(Value::as_object),
+        msg.pointer("/params/arguments").and_then(Value::as_object),
+    ];
+    for m in objects.into_iter().flatten() {
+        let mut seen = BTreeSet::new();
+        for k in m.keys() {
+            let f = fold(k);
+            if !seen.insert(f.clone()) || CHECKED.iter().any(|c| fold(c) == f && c != k) {
+                return Err(k.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A message from the server, on its way to the client.
 pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(line) else {
@@ -910,6 +1001,33 @@ struct Shared {
     home: PathBuf,
     log: Log,
     stop: AtomicBool,
+    /// Open connections (socket clients and egress tunnels together).
+    open: Arc<AtomicUsize>,
+}
+
+/// Connections served at once; past this an accepted one is closed at once,
+/// before any thread is spawned. Each holds a thread until it ends, and a
+/// stalled handshake ends after its 10 s read timeout.
+const MAX_CONNECTIONS: usize = 32;
+
+/// A connection slot, released on drop.
+struct Permit(Arc<AtomicUsize>);
+
+impl Permit {
+    #[allow(deprecated)] // `try_update` is not in the pinned 1.94 toolchain
+    fn take(open: &Arc<AtomicUsize>) -> Option<Self> {
+        open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_CONNECTIONS).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| Self(Arc::clone(open)))
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The running broker. Dropping it stops every child and removes the socket.
@@ -957,6 +1075,7 @@ impl Broker {
             home: home.to_path_buf(),
             log,
             stop: AtomicBool::new(false),
+            open: Arc::new(AtomicUsize::new(0)),
         });
         for (id, l) in egress {
             let s = Arc::clone(&shared);
@@ -967,9 +1086,15 @@ impl Broker {
                 while !s.stop.load(Ordering::Acquire) {
                     match l.accept() {
                         Ok((stream, _)) => {
+                            let Some(permit) = Permit::take(&s.open) else {
+                                continue;
+                            };
                             let hosts = server.spec.egress_hosts.clone();
                             let (log, id) = (s.log.clone(), id.clone());
-                            std::thread::spawn(move || egress_tunnel(stream, &hosts, &log, &id));
+                            std::thread::spawn(move || {
+                                let _permit = permit;
+                                egress_tunnel(stream, &hosts, &log, &id);
+                            });
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(50)),
                     }
@@ -981,8 +1106,14 @@ impl Broker {
             while !s.stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let Some(permit) = Permit::take(&s.open) else {
+                            continue;
+                        };
                         let s = Arc::clone(&s);
-                        std::thread::spawn(move || serve(&s, stream));
+                        std::thread::spawn(move || {
+                            let _permit = permit;
+                            serve(&s, stream);
+                        });
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
@@ -1087,6 +1218,8 @@ fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<Child> {
         .env("http_proxy", &proxy)
         .env("NO_PROXY", "")
         .env("no_proxy", "")
+        // Never the agent-writable project: `python3 -m x` imports from cwd.
+        .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // ponytail: stderr dropped; route it to the proxy log, bounded and
@@ -1250,6 +1383,11 @@ fn serve(shared: &Shared, stream: UnixStream) {
         let Ok(mut slot) = server.child.lock() else {
             return;
         };
+        // Under the slot lock: Drop sets `stop` before scanning the slots,
+        // so either it sees this child or no child is started.
+        if shared.stop.load(Ordering::Acquire) {
+            return;
+        }
         if slot.is_some() {
             // ponytail: one client per server; multiplexing needs id rewriting.
             refuse("this MCP server already has a client in this session");
@@ -1470,6 +1608,18 @@ pub fn opencode_overlay(
             _ => return None,
         },
     };
+    // Every name the user's files or this overlay already use: a fallback
+    // must never land on one.
+    let mut used: BTreeSet<String> = configs
+        .iter()
+        .flat_map(|c| [c.pointer("/mcp/servers"), c.get("mcp")])
+        .chain([
+            root.get("mcp").and_then(|m| m.get("servers")),
+            root.get("mcp"),
+        ])
+        .filter_map(|m| m.and_then(Value::as_object))
+        .flat_map(|m| m.keys().cloned())
+        .collect();
     for spec in specs {
         let mut names: Vec<(bool, String)> = Vec::new();
         for c in configs {
@@ -1484,21 +1634,7 @@ pub fn opencode_overlay(
         names.sort();
         names.dedup();
         if names.is_empty() {
-            let short = spec.short_name();
-            let taken = configs.iter().any(|c| {
-                c.pointer("/mcp/servers")
-                    .and_then(|m| m.get(short))
-                    .is_some()
-                    || c.pointer("/mcp").and_then(|m| m.get(short)).is_some()
-            });
-            names.push((
-                true,
-                if taken {
-                    spec.full_name()
-                } else {
-                    short.to_string()
-                },
-            ));
+            names.push((true, free_name(spec, &mut used, true)));
         }
         for (v2, name) in names {
             let mut parent = object_at(&mut root, "mcp")?;
@@ -1520,6 +1656,28 @@ pub fn opencode_overlay(
     Some(Value::Object(root).to_string())
 }
 
+/// A name no user entry or earlier spec has: the short name (when
+/// `short_first`), then the full id, then the full id with a counter.
+fn free_name(spec: &Spec, used: &mut BTreeSet<String>, short_first: bool) -> String {
+    let full = spec.full_name();
+    let mut name = if short_first {
+        spec.short_name().to_string()
+    } else {
+        full.clone()
+    };
+    let mut n = 1;
+    while used.contains(&name) {
+        name = if n == 1 {
+            full.clone()
+        } else {
+            format!("{full}-{n}")
+        };
+        n += 1;
+    }
+    used.insert(name.clone());
+    name
+}
+
 fn object_at<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut Map<String, Value>> {
     map.entry(key)
         .or_insert_with(|| Value::Object(Map::new()))
@@ -1536,6 +1694,11 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
         .unwrap_or(Value::Null);
     let mut args = Vec::new();
     let mut servers = Map::new();
+    let mut used: BTreeSet<String> = user
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
     for spec in specs {
         let mut matching: Vec<&String> = user
             .get("mcpServers")
@@ -1552,7 +1715,7 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
         matching.sort();
         // Its own name: whether --additional-mcp-config wins over a
         // same-named user entry is not documented, so never share one.
-        let name = spec.full_name();
+        let name = free_name(spec, &mut used, false);
         for other in &matching {
             args.push("--disable-mcp-server".into());
             args.push((*other).clone());
@@ -1623,15 +1786,8 @@ pub fn copilot(home: &Path, broker: &Broker) -> Vec<String> {
 
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
 /// directory would, without starting anything.
-pub fn run_status(
-    as_json: bool,
-    home: &Path,
-    writable: &[PathBuf],
-    disabled: &[String],
-    enabled: bool,
-) -> ExitCode {
-    let found = load(&spec_dir(home), writable, disabled);
-    let status = status_json(&found, enabled && cfg!(target_os = "macos"), true);
+pub fn run_status(as_json: bool, home: &Path, found: &Detected, enabled: bool) -> ExitCode {
+    let status = status_json(found, enabled && cfg!(target_os = "macos"), true);
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
@@ -1640,13 +1796,13 @@ pub fn run_status(
     for s in status["servers"].as_array().into_iter().flatten() {
         println!(
             "  {}  {}  credential_ok: {}",
-            s["id"].as_str().unwrap_or(""),
+            s["id"].as_str().unwrap_or("").escape_debug(),
             s["state"].as_str().unwrap_or(""),
             s["credential_ok"]
         );
     }
     for r in &found.rejected {
-        println!("  rejected {}: {}. Fix: {}", r.file, r.reason, r.fix);
+        println!("  {}", r.line());
     }
     ExitCode::SUCCESS
 }
@@ -2169,5 +2325,126 @@ mod tests {
         let mut l = String::new();
         ra.read_line(&mut l).unwrap();
         assert!(l.contains("too many restarts"), "{l}");
+    }
+
+    #[test]
+    fn file_level_write_grants_and_policy_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(FILE);
+        std::fs::write(&f, spec_json(with(base(), "/credential", json!("none")))).unwrap();
+        let found = load(dir.path(), std::slice::from_ref(&f), &[]);
+        assert!(found.specs.is_empty() && found.rejected[0].reason.contains("can write"));
+        let mut found = load(dir.path(), &[], &[]);
+        assert_eq!(found.specs.len(), 1);
+        assert_eq!(found.specs[0].file, f);
+        drop_writable(&mut found, |p| (p == f).then(|| PathBuf::from("/grant")));
+        assert!(found.specs.is_empty());
+        assert!(found.rejected[0].reason.contains("/grant"));
+    }
+
+    #[test]
+    fn rejected_lines_are_escaped() {
+        let r = Rejected {
+            file: "a\u{1b}[2Jb.json".into(),
+            reason: "x\ny".into(),
+            fix: "f".into(),
+        };
+        let l = r.line();
+        assert!(!l.contains('\u{1b}') && !l.contains('\n'), "{l}");
+    }
+
+    #[test]
+    fn ambiguous_keys_are_refused() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        for m in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_nais_context","Name":"execute_graphql"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"NAME":"execute_graphql"}}"#,
+            r#"{"jsonrpc":"2.0","ID":1,"method":"notifications/initialized"}"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"execute_graphql\",\"arguments\":{\"query\":\"{ a }\",\"querſ\":1,\"Query\":\"mutation { x }\"}}}",
+        ] {
+            assert!(matches!(on_client(m, &s, &mut p), Action::Reply(..)), "{m}");
+        }
+        let ok = r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"Name":"x"}}}"#;
+        assert!(matches!(on_client(ok, &s, &mut p), Action::Forward(_)));
+    }
+
+    #[test]
+    fn connection_permits_are_bounded() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let held: Vec<Permit> = (0..MAX_CONNECTIONS)
+            .map(|_| Permit::take(&open).unwrap())
+            .collect();
+        assert!(Permit::take(&open).is_none());
+        drop(held);
+        assert!(Permit::take(&open).is_some());
+    }
+
+    #[test]
+    fn fallback_names_never_collide() {
+        let one = Spec {
+            id: "io.example.one/server".into(),
+            ..check(with(base(), "/credential", json!("none"))).unwrap()
+        };
+        let two = Spec {
+            id: "io.example.two/server".into(),
+            ..one.clone()
+        };
+        let sock = Path::new("/s");
+        let user = json!({"mcp": {"servers": {"io.example.one__server": {"type": "remote"}}}});
+        let out: Value =
+            serde_json::from_str(&opencode_overlay(None, &[user], &[&one, &two], sock).unwrap())
+                .unwrap();
+        let names: Vec<&String> = out["mcp"]["servers"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["io.example.two__server", "server"], "{out}");
+        let cfg = r#"{"mcpServers":{"io.example.two__server":{"command":"x"}}}"#;
+        let args = copilot_args(Some(cfg), &[&one, &two], sock);
+        let v: Value = serde_json::from_str(args.last().unwrap()).unwrap();
+        let names: Vec<&String> = v["mcpServers"].as_object().unwrap().keys().collect();
+        assert_eq!(
+            names,
+            ["io.example.one__server", "io.example.two__server-2"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sh_broker(script: &str) -> Broker {
+        let mut spec = check(base()).unwrap();
+        spec.command = vec!["sh".into(), "-c".into(), script.into()];
+        spec.program = "/bin/sh".into();
+        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_child_runs_in_root_with_a_cleared_env() {
+        let b = sh_broker(
+            r#"read l; printf '{"jsonrpc":"2.0","id":1,"result":{"cwd":"%s","pp":"%s"}}\n' "$PWD" "${PYTHONPATH:-none}"; cat >/dev/null"#,
+        );
+        let (mut a, mut ra) = connect(&b);
+        writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        let v: Value = serde_json::from_str(&l).unwrap();
+        assert_eq!(v["result"]["cwd"], "/", "{l}");
+        assert_eq!(v["result"]["pp"], "none", "{l}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_child_after_stop() {
+        let b = cat_broker();
+        b.shared.stop.store(true, Ordering::Release);
+        let (_a, mut ra) = connect(&b);
+        let mut l = String::new();
+        let n = ra.read_line(&mut l).unwrap_or(0);
+        assert_eq!(n, 0, "closed without serving: {l}");
+        assert!(
+            b.shared.servers["io.github.nais/nais-mcp"]
+                .child
+                .lock()
+                .unwrap()
+                .is_none()
+        );
     }
 }

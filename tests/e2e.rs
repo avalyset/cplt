@@ -2395,6 +2395,45 @@ mod e2e_tests {
         out
     }
 
+    /// #824: a spec under a tree only the final policy makes writable (a
+    /// writable tool dir, here `~/.npm`, not the project or `allow.write`) is
+    /// rejected; the same spec under `~/.config` is the control.
+    #[test]
+    fn e2e_mcp_status_rejects_specs_the_policy_makes_writable() {
+        let home = home_temp_dir("mcp-status");
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1, "credential": "none", "command": ["python3", "x.py"],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        let status = |xdg: &Path| {
+            let dir = xdg.join("cplt/mcp");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+            let out = cplt_cmd()
+                .args(["--agent", "copilot", "mcp", "status", "--json"])
+                .env("HOME", &home_path)
+                .env("XDG_CONFIG_HOME", xdg)
+                .current_dir(project_dir())
+                .output()
+                .expect("binary should run");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let line = stdout.lines().last().unwrap_or("").to_string();
+            let v: serde_json::Value = serde_json::from_str(&line)
+                .unwrap_or_else(|_| panic!("{stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+            v
+        };
+        let ok = status(&home_path.join(".config"));
+        assert_eq!(ok["servers"][0]["id"], "io.example/fake-mcp", "{ok}");
+        let bad = status(&home_path.join(".npm/xdg"));
+        assert!(bad["servers"].as_array().unwrap().is_empty(), "{bad}");
+        let reason = bad["rejected"][0]["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("writable in the sandbox"), "{bad}");
+    }
+
     /// MCP host broker (#824), end to end through cplt: a broker spec for a
     /// fake stdio server, a fake Copilot that drives `cplt mcp-stdio` from
     /// inside the sandbox with the entry cplt added to its args. The server
@@ -2450,10 +2489,17 @@ for line in sys.stdin:
 
         let fake = fake_agent_dir("copilot");
         let agent = fake.path().join("copilot");
+        // The real interpreter, not the /usr/bin/python3 stub: the stub runs
+        // xcodebuild, which fails inside the sandbox on CI runners.
+        let python = Command::new("/usr/bin/python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("python3 on the host");
+        let python = String::from_utf8(python.stdout).unwrap().trim().to_string();
         std::fs::write(
             &agent,
             format!(
-                r#"#!/usr/bin/python3
+                r#"#!{python}
 import sys, json, os, subprocess
 a = sys.argv
 cfg = json.loads(a[a.index("--additional-mcp-config") + 1])

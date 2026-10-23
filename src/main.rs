@@ -4735,19 +4735,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &resolved.allow_write,
         Some(&scratch::ScratchDir::base(&home_dir)),
     );
-    if let Some(json) = mcp_status {
-        return Ok(cplt::mcp_broker::run_status(
-            json,
-            &home_dir,
+    let mcp_found = match (mcp_status, resolved.mcp_broker) {
+        (Some(_), _) => cplt::mcp_broker::load(
+            &cplt::mcp_broker::spec_dir(&home_dir),
             &mcp_writable,
             &cli.no_mcp_broker,
-            resolved.mcp_broker,
-        ));
-    }
-    let mcp_found = if resolved.mcp_broker {
-        cplt::mcp_broker::detect(&home_dir, &mcp_writable, &cli.no_mcp_broker)
-    } else {
-        cplt::mcp_broker::Detected::default()
+        ),
+        (None, true) => cplt::mcp_broker::detect(&home_dir, &mcp_writable, &cli.no_mcp_broker),
+        (None, false) => cplt::mcp_broker::Detected::default(),
     };
 
     let AssembledSandbox {
@@ -4777,11 +4772,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             pnpm_candidate: None,
-            inspect_only: cli.print_profile,
+            inspect_only: cli.print_profile || mcp_status.is_some(),
             opencode_v2,
-            mcp_specs: &mcp_found.specs,
+            mcp: mcp_status.is_none().then_some(&mcp_found),
         },
     )?;
+    // `cplt mcp status`: the same specs, judged by this launch's final policy.
+    if let Some(json) = mcp_status {
+        let mut found = mcp_found;
+        cplt::mcp_broker::drop_writable(&mut found, |p| {
+            cplt::check::writable_tree_on_path(&policy, &home_dir, p).map(|(_, tree)| tree)
+        });
+        return Ok(cplt::mcp_broker::run_status(
+            json,
+            &home_dir,
+            &found,
+            resolved.mcp_broker,
+        ));
+    }
 
     // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
@@ -6202,8 +6210,9 @@ struct AssemblyOptions<'a> {
     inspect_only: bool,
     /// An OpenCode v2 session: the host state dir is not granted (#796).
     opencode_v2: bool,
-    /// Brokered MCP servers to serve (#824); empty off the launch path.
-    mcp_specs: &'a [cplt::mcp_broker::Spec],
+    /// Brokered MCP servers to serve (#824); `None` off the launch path.
+    /// Checked against the final policy before the broker starts.
+    mcp: Option<&'a cplt::mcp_broker::Detected>,
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -6543,20 +6552,6 @@ fn assemble_sandbox(
         },
         _ => None,
     };
-    // Bound for `--print-profile` too, so the printed profile has its rule.
-    let mcp_broker = match opts.mcp_specs {
-        [] => None,
-        specs => {
-            let log = cplt::mcp_broker::Log {
-                file: resolved.proxy_log_file.clone(),
-            };
-            cplt::mcp_broker::Broker::start(specs.to_vec(), home_dir, log)
-                .inspect_err(|e| {
-                    ui::warn(&format!("MCP broker unavailable: {e}. Left as configured."));
-                })
-                .ok()
-        }
-    };
     let mut sandbox_config = build_sandbox_config(
         resolved,
         probe,
@@ -6575,6 +6570,29 @@ fn assemble_sandbox(
     );
 
     let policy = sandbox::generate_policy(&sandbox_config);
+    // The broker socket is added after this, so the policy it is judged by
+    // is the session's own. Bound for `--print-profile` too.
+    let mcp_broker = opts.mcp.and_then(|found| {
+        let mut found = cplt::mcp_broker::Detected {
+            specs: found.specs.clone(),
+            ..Default::default()
+        };
+        cplt::mcp_broker::drop_writable(&mut found, |p| {
+            cplt::check::writable_tree_on_path(&policy, home_dir, p).map(|(_, tree)| tree)
+        });
+        for r in &found.rejected {
+            ui::warn(&r.line());
+        }
+        if found.specs.is_empty() {
+            return None;
+        }
+        let log = cplt::mcp_broker::Log {
+            file: resolved.proxy_log_file.clone(),
+        };
+        cplt::mcp_broker::Broker::start(found.specs, home_dir, log)
+            .inspect_err(|e| ui::warn(&format!("MCP broker unavailable: {e}. Left as configured.")))
+            .ok()
+    });
     let read_denies = sandbox::ReadDenies::from_config_for_current_os(&sandbox_config);
     // Here, not at each caller: the launch, `exec` and `check` all build their
     // policy through this function, and all three must say it.
@@ -6765,7 +6783,7 @@ fn prepare_shell_sandbox(
             // `cplt check` only reports on the policy.
             inspect_only: true,
             opencode_v2: false,
-            mcp_specs: &[],
+            mcp: None,
         },
     )
 }
@@ -6939,7 +6957,7 @@ fn run_exec_command(
                 pnpm_candidate,
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
-                mcp_specs: &[],
+                mcp: None,
             },
         )?
     };
