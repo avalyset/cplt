@@ -634,6 +634,9 @@ fn cache_gh_token_to_file(
         }
         return;
     };
+    // Under token injection everything below gets the placeholder (#820),
+    // whether or not a token file can be written.
+    let token = crate::token_inject::mask(&token);
     // Both consumers must locate the producer's scratch dir, not an explicitly
     // passed TMPDIR that may contain another session's stale credential.
     cmd.env(GH_TOKEN_DIR_ENV, scratch_dir);
@@ -1469,6 +1472,8 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    // Last env step: no real GitHub token may be set after it (#820).
+    crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Nothing the caller was holding open crosses into the agent.
     seal_inherited_fds(&mut cmd, Vec::new());
 
@@ -1614,6 +1619,8 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    // Last env step: no real GitHub token may be set after it (#820).
+    crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Before the Landlock hook below: that hook opens descriptors of its own,
     // and they must not be sealed.
     seal_inherited_fds(&mut cmd, Vec::new());
@@ -1852,6 +1859,8 @@ fn exec_bwrap(
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     apply_session_env(&mut cmd, sandbox.opencode_v2, &sandbox.extra_env, deny_env);
+    // Last env step: no real GitHub token may be set after it (#820).
+    crate::token_inject::apply_to_child(&mut cmd, inherit_env);
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(
