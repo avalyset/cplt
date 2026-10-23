@@ -2679,9 +2679,14 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
     )]
 }
 
-fn warn_unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) {
-    for message in unlinked_child_repos_messages(project_dir, named_roots) {
-        ui::warn(&message);
+fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &[PathBuf]) {
+    // A hint, not a risk: shown once per set of unlinked repos (output policy).
+    // An empty set is recorded too, so a repo that comes back shows again.
+    let messages = unlinked_child_repos_messages(project_dir, named_roots);
+    if cplt::launch_state::changed(home_dir, project_dir, "nested", &messages.join("\n")) {
+        for message in messages {
+            ui::warn(&message);
+        }
     }
 }
 
@@ -4394,6 +4399,7 @@ fn resolve_config_only() -> anyhow::Result<config::Resolved> {
 }
 
 fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
+    ui::set_verbose(cli.verbose);
     // Handle --init-config
     if cli.init_config {
         return Ok(init_config());
@@ -4657,7 +4663,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved, active_agent);
     if !resolved.quiet {
-        warn_unlinked_child_repos(&project_dir, &repo_paths);
+        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
     }
 
     // Probe the host for everything the sandbox profile depends on.
