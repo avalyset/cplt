@@ -1602,7 +1602,7 @@ const CONFIRM_PROMPT: &str =
 /// if no TTY is available without --yes.
 fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     if auto_yes {
-        if !quiet {
+        if !quiet && ui::verbose() {
             ui::info("Auto-confirmed (--yes)");
         }
         return Ok(());
@@ -2970,7 +2970,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     }
                     _ => "",
                 };
-                ui::info(&format!("Repo config: .cplt.toml{source_note}"));
+                if ui::verbose() {
+                    ui::info(&format!("Repo config: .cplt.toml{source_note}"));
+                }
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
             warn_glob_like_deny_paths(
@@ -3319,7 +3321,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
-    if !resolved.quiet {
+    if !resolved.quiet && ui::verbose() {
         ui::info(&format!("Project:  {}", project_dir.display()));
         if let Some(ref cp) = config_path {
             ui::info(&format!("Config:   {}", cp.display()));
@@ -3387,7 +3389,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         },
     };
 
-    if !resolved.quiet {
+    if !resolved.quiet && ui::verbose() {
         ui::info(&format!("Agent:    {}", active_agent.display_name()));
     }
 
@@ -4229,7 +4231,7 @@ fn start_proxy_if_enabled(
     }) {
         Ok(handle) => {
             resolved.proxy_port = handle.port;
-            if !resolved.quiet {
+            if !resolved.quiet && ui::verbose() {
                 ui::ok(&format!(
                     "Proxy running on localhost:{} (thread)",
                     handle.port
@@ -4863,7 +4865,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {
-                if !resolved.quiet {
+                if !resolved.quiet && ui::verbose() {
                     print_preflight_ok();
                 }
             }
@@ -4941,6 +4943,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let banner = std::sync::Once::new();
     let print_banner = || {
         banner.call_once(|| {
+            // Detail tier (output policy): the summary line already names the agent.
+            if !ui::verbose() {
+                return;
+            }
             ui::ok(&format!(
                 "Starting {} in sandbox...",
                 active_agent.display_name()

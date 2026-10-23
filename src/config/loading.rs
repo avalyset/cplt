@@ -1586,7 +1586,7 @@ impl Resolved {
         }
         eprintln!(
             "{blue}[cplt]{nc} {}",
-            self.summary_line(repos.len(), worktree_root.is_some())
+            self.summary_line(agent, repos.len(), worktree_root.is_some())
         );
         for line in lines.iter().filter(|l| l.contains('\u{26a0}')) {
             eprintln!("{line}");
@@ -1595,7 +1595,7 @@ impl Resolved {
 
     /// The one-line steady-state summary: repositories, writable paths,
     /// network and guards. The table stays behind `--verbose`.
-    fn summary_line(&self, repos: usize, worktrees: bool) -> String {
+    fn summary_line(&self, agent: crate::agent::Agent, repos: usize, worktrees: bool) -> String {
         let mut write = vec!["project".to_string()];
         if worktrees {
             write.push("worktrees".into());
@@ -1623,7 +1623,8 @@ impl Resolved {
             guards.join("+")
         };
         format!(
-            "Sandbox: {repos} repo{} · write: {} · network: {}, {proxy} · guards: {guards} · unchanged since last launch (--verbose shows the table)",
+            "Sandbox for {}: {repos} repo{} · write: {} · network: {}, {proxy} · guards: {guards} · unchanged since last launch (--verbose shows the table)",
+            agent.display_name(),
             if repos == 1 { "" } else { "s" },
             write.join(", "),
             ports.join(",")
