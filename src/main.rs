@@ -2665,6 +2665,41 @@ fn unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) -> Vec<Path
     out
 }
 
+/// #830: keep cplt's state in `~/.config/cplt` for this launch when
+/// `$XDG_CONFIG_HOME/cplt` lies inside a tree the sandbox will grant. Runs
+/// before any state is read, so a file the agent planted there in an earlier
+/// session is never trusted. `sandbox::prepare` repeats the check as a
+/// backstop with the fully resolved grants.
+fn pin_state_out_of_grants(
+    resolved: &config::Resolved,
+    home_dir: &Path,
+    project_dir: &Path,
+    roots: &[PathBuf],
+    active_agent: agent::Agent,
+) {
+    let mut trees = vec![project_dir.to_path_buf()];
+    trees.extend(roots.iter().cloned());
+    trees.extend(resolved.allow_read.iter().cloned());
+    trees.extend(resolved.allow_write.iter().cloned());
+    trees.extend(
+        sandbox::HOME_TOOL_DIRS
+            .iter()
+            .filter(|d| d.write)
+            .map(|d| home_dir.join(d.path)),
+    );
+    for dir in resolved.agent_config_dirs(active_agent, home_dir) {
+        trees.extend(dir.write_files.iter().map(|f| dir.path.join(f)));
+        if dir.write {
+            trees.push(dir.path);
+        }
+    }
+    if let Some((dir, tree)) =
+        sandbox::pin_legacy_state_dir_if_inside(&sandbox::process_env, home_dir, &trees)
+    {
+        ui::warn(&sandbox::state_pinned_message(&dir, &tree));
+    }
+}
+
 /// Sanitize text for terminal display so an untrusted directory name or path
 /// cannot inject control characters or ANSI sequences.
 fn sanitize_terminal_text(s: &str) -> String {
@@ -4721,6 +4756,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
     let policy_roots = policy_roots(&repo_paths, worktree_root.as_deref());
+    pin_state_out_of_grants(
+        &resolved,
+        &home_dir,
+        &project_dir,
+        &policy_roots,
+        active_agent,
+    );
     // Built once: the brief, the startup summary and `doctor` must not each
     // resolve the identities separately and risk disagreeing.
     let repo_rows = repo_summary_rows(&project_dir, &repo_roots);

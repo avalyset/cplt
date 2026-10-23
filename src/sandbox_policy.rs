@@ -93,6 +93,40 @@ pub fn pin_legacy_state_dir() {
     LEGACY_STATE_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `$XDG_CONFIG_HOME/cplt` and the first of `trees` it lies inside, compared
+/// lexically and canonically. `None` when state is not moved or is outside.
+#[must_use]
+pub fn xdg_state_dir_inside(
+    env: &CacheEnv,
+    home: &Path,
+    trees: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    let dir = xdg_state_dir(env).filter(|d| *d != home.join(CPLT_STATE_DIR))?;
+    let canon = config::canonicalize_deepest;
+    let resolved = canon(&dir);
+    trees
+        .iter()
+        .find(|t| dir.starts_with(t) || resolved.starts_with(canon(t)))
+        .map(|t| (dir.clone(), t.clone()))
+}
+
+/// Pin state to `$HOME/.config/cplt` ([`pin_legacy_state_dir`]) when the XDG
+/// location lies inside one of `trees`, the sandbox's grants. Call it before
+/// any state is read. Returns the pair to report, once: `None` when already
+/// pinned.
+pub fn pin_legacy_state_dir_if_inside(
+    env: &CacheEnv,
+    home: &Path,
+    trees: &[PathBuf],
+) -> Option<(PathBuf, PathBuf)> {
+    if LEGACY_STATE_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let found = xdg_state_dir_inside(env, home, trees)?;
+    pin_legacy_state_dir();
+    Some(found)
+}
+
 /// The state directory to use for the file `name`: [`cplt_state_dir`],
 /// unless `name` exists only under the legacy `$HOME/.config/cplt`.
 ///

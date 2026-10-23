@@ -111,10 +111,10 @@ pub use policy::{
     exec_write_conflicts, first_party_read_target, home_config_link_targets, home_tool_dirs,
     linux_docker_socket_paths, linux_rootless_socket_paths, linux_runtime_dirs,
     mise_ro_protect_paths, nested_alternation, no_cache_env, no_exec_temp_dir_over,
-    no_exec_tool_dir_over, path_bin_dirs, playwright_runtime_intent, process_env,
-    relocatable_tool_prefix, shim_ro_protect_paths, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
-    xdg_runtime_dir_env,
+    no_exec_tool_dir_over, path_bin_dirs, pin_legacy_state_dir_if_inside,
+    playwright_runtime_intent, process_env, relocatable_tool_prefix, shim_ro_protect_paths,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env, xdg_state_dir,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -1058,44 +1058,52 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// The moved cplt state directory and the granted tree it lies inside, if
-/// any: the project, a named root, or an `allow.read`/`allow.write` path.
-///
-/// `XDG_CONFIG_HOME` moves the state directory (#830). Inside a grant, the
-/// agent could read or write the trust store, and Landlock has no deny to
-/// stop it. The legacy directory is not checked: its overlaps are refused per
-/// grant already.
-fn state_dir_in_grant(config: &SandboxConfig) -> Option<(PathBuf, PathBuf)> {
-    let canon = crate::config::canonicalize_deepest;
-    let dir = policy::xdg_state_dir(config.copilot_cache_env)?;
-    if dir == config.home_dir.join(policy::CPLT_STATE_DIR) {
-        return None;
-    }
-    // Every writable tree (project, named roots, allow.write, worktrees,
-    // scratch, caches), plus the read grants. An ancestor inside a writable
-    // tree could also be renamed around the deny, so inside means inside.
-    let resolved = canon(&dir);
+/// The trees the sandbox grants (every writable tree, named roots, read
+/// grants) that `$XDG_CONFIG_HOME/cplt` must stay out of (#830).
+fn state_grant_trees(config: &SandboxConfig) -> Vec<PathBuf> {
     canonical_writable_trees(config)
         .into_iter()
         .map(|(t, _)| t)
-        .chain(config.named_roots.iter().map(|t| canon(t)))
-        .chain(config.extra_read.iter().map(|t| canon(t)))
-        .find(|tree| resolved.starts_with(tree) || dir.starts_with(tree))
-        .map(|tree| (dir.clone(), tree))
+        .chain(config.named_roots.iter().cloned())
+        .chain(config.extra_read.iter().cloned())
+        .collect()
 }
 
-/// Keep state in the legacy, always-denied `~/.config/cplt` for this launch
-/// when the XDG location is inside a grant, and say so once.
+/// The moved state directory and the granted tree it lies inside, if any.
+#[cfg(test)]
+fn state_dir_in_grant(config: &SandboxConfig) -> Option<(PathBuf, PathBuf)> {
+    policy::xdg_state_dir_inside(
+        config.copilot_cache_env,
+        config.home_dir,
+        &state_grant_trees(config),
+    )
+}
+
+/// Backstop for the launch-time pin in `main`: keep state in the legacy,
+/// always-denied `~/.config/cplt` when the XDG location is inside a grant.
 fn keep_state_out_of_grants(config: &SandboxConfig) {
-    if let Some((dir, tree)) = state_dir_in_grant(config) {
-        policy::pin_legacy_state_dir();
-        crate::ui::warn(&format!(
-            "cplt state stays in ~/.config/cplt: {} is inside the sandbox's grant on {}. \
-             Point XDG_CONFIG_HOME elsewhere to move it.",
-            dir.display(),
-            tree.display()
-        ));
+    if let Some((dir, tree)) = policy::pin_legacy_state_dir_if_inside(
+        config.copilot_cache_env,
+        config.home_dir,
+        &state_grant_trees(config),
+    ) {
+        crate::ui::warn(&state_pinned_message(&dir, &tree));
     }
+}
+
+/// The one line printed when state stays in `~/.config/cplt`, with control
+/// characters in the paths replaced.
+#[must_use]
+pub fn state_pinned_message(dir: &Path, tree: &Path) -> String {
+    format!(
+        "cplt state stays in ~/.config/cplt: {} is inside the sandbox's grant on {}. \
+         Point XDG_CONFIG_HOME elsewhere to move it.",
+        dir.display(),
+        tree.display()
+    )
+    .chars()
+    .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+    .collect()
 }
 
 /// Refuse one grant that no launch can honour, with the reason.

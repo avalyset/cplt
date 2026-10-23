@@ -226,8 +226,10 @@ fn opencode_v2_within(
     home: &Path,
     mut probe: impl FnMut(&Path, std::time::Duration) -> crate::discover::VersionProbe,
 ) -> Option<bool> {
-    let cache_dir =
-        &crate::sandbox::cplt_state_dir_for(&crate::sandbox::process_env, home, "opencode-version");
+    // Always the legacy dir, never `$XDG_CONFIG_HOME/cplt` (#830): this verdict
+    // decides whether v2 runs on the 1.x path (#725), and it is only a cache,
+    // so moving it would add a place to forge it and buy nothing.
+    let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
         .components()
@@ -3552,6 +3554,35 @@ mod tests {
             let state = home.join(crate::sandbox::CPLT_STATE_DIR);
             assert!(state.join("opencode-version").exists());
             assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+        });
+    }
+
+    /// #830: a version verdict forged at `$XDG_CONFIG_HOME/cplt` (inside an
+    /// `allow.write` tree, say) is never read: the probe runs and says v2.
+    #[test]
+    fn opencode_v2_verdict_is_not_read_from_the_xdg_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, "#!/bin/sh\necho opencode v2.0.24\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = std::fs::canonicalize(&bin).unwrap();
+        let meta = std::fs::metadata(&real).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let xdg = dir.path().join("granted");
+        std::fs::create_dir_all(xdg.join("cplt")).unwrap();
+        std::fs::write(
+            xdg.join("cplt/opencode-version"),
+            format!("{}\t{}\t{mtime}\t1.18.35\n", real.display(), meta.len()),
+        )
+        .unwrap();
+        temp_env::with_var("XDG_CONFIG_HOME", Some(&xdg), || {
+            assert_eq!(is_opencode_v2(&bin, &dir.path().join("home")), Some(true));
         });
     }
 

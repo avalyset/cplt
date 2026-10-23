@@ -26,12 +26,12 @@ use super::policy::{
     HOME_CONFIG_FILES, HomeToolDir, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_KEY_FILE_EXTENSION_PATTERNS, SENSITIVE_PROJECT_PATTERNS,
     SYSTEM_READ_FILES, TOOL_READ_DIRS, XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation,
-    app_dirs, colima_socket_paths, copilot_default_pkg_dir, cplt_state_dirs, current_uid,
+    app_dirs, colima_socket_paths, copilot_default_pkg_dir, current_uid,
     cypress_app_data_dir_with_env, cypress_runtime_intent, escape_regex, first_party_read_target,
     grant_is_refused, home_config_link_targets, missing_home_config_link_targets,
     nested_alternation, path_bin_dirs, playwright_runtime_intent, pnpm_config_dirs,
     pnpm_credential_files, read_only_home_config, rel_is_glob, rel_regex,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    validate_playwright_socket_dir, validate_sbpl_path, xdg_state_dir,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -2663,11 +2663,13 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
     // `$XDG_CONFIG_HOME/cplt` holds cplt's state when that variable moves it
     // (#830), and is denied like `~/.config/cplt`. `cplt_state_dir` only
     // returns UTF-8 paths, and the legacy one is already in the list.
+    // Denied even when this launch keeps state in the legacy dir: then nothing
+    // of cplt's is there, and a later launch may use it.
     let legacy_state = Path::new(home).join(CPLT_STATE_DIR);
-    let moved_state: Vec<String> = cplt_state_dirs(config.copilot_cache_env, Path::new(home))
-        .into_iter()
+    let moved_state: Vec<String> = xdg_state_dir(config.copilot_cache_env)
         .filter(|dir| *dir != legacy_state)
-        .filter_map(|dir| dir.to_str().map(str::to_owned))
+        .and_then(|dir| dir.to_str().map(str::to_owned))
+        .into_iter()
         .collect();
     let dirs: Vec<Vec<String>> = DENIED_DOTFILES
         .iter()
@@ -2725,13 +2727,6 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
         dirs.iter()
             .chain(&files)
             .filter_map(|s| s.get(1).map(PathBuf::from)),
-    );
-    // The moved state dir is pinned whether or not it is a link: under a
-    // writable tree its ancestors could be renamed around the deny.
-    targets.extend(
-        moved_state
-            .iter()
-            .map(|d| crate::config::canonicalize_deepest(Path::new(d))),
     );
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
