@@ -367,6 +367,17 @@ pub struct Detected {
 /// write), a symlink, or a spec that fails validation is rejected, never
 /// loaded. No directory means no specs.
 pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
+    load_with(dir, writable, disabled, crate::git::trusted_binary)
+}
+
+/// [`load`] with the trusted-dir lookup injected, so tests need no real
+/// binaries.
+pub(crate) fn load_with(
+    dir: &Path,
+    writable: &[PathBuf],
+    disabled: &[String],
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Detected {
     let mut out = Detected::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -427,9 +438,7 @@ pub fn load(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
                 format!("nav-pilot mcp enable {id}")
             };
             match crate::untrusted::read_untrusted(&path, SPEC_LIMIT) {
-                Ok(Some(text)) => {
-                    validate(&text, &file, crate::git::trusted_binary).map_err(|r| (r, enable()))
-                }
+                Ok(Some(text)) => validate(&text, &file, &resolve).map_err(|r| (r, enable())),
                 Ok(None) => Err(("not a regular file, or too large".into(), enable())),
                 Err(e) => Err((format!("cannot read ({e})"), enable())),
             }
@@ -477,6 +486,13 @@ pub fn detect(home: &Path, writable: &[PathBuf], disabled: &[String]) -> Detecte
 
 #[cfg(test)]
 mod tests {
+    /// `load` with a fake trusted-dir lookup: every name resolves.
+    fn load_test(dir: &Path, writable: &[PathBuf], disabled: &[String]) -> Detected {
+        load_with(dir, writable, disabled, |n| {
+            Some(PathBuf::from("/opt/homebrew/bin").join(n))
+        })
+    }
+
     use super::*;
     use crate::mcp_broker::test_util::*;
 
@@ -616,7 +632,7 @@ mod tests {
         let real = dir.path().join("real.json");
         std::fs::write(&real, spec_json(base())).unwrap();
         std::os::unix::fs::symlink(&real, dir.path().join(FILE)).unwrap();
-        let found = load(dir.path(), &[], &[]);
+        let found = load_test(dir.path(), &[], &[]);
         assert!(found.specs.is_empty());
         let r = found
             .rejected
@@ -626,12 +642,12 @@ mod tests {
         assert!(r.fix.starts_with("replace the symlink"), "{r:?}");
         std::fs::remove_file(dir.path().join(FILE)).unwrap();
         std::fs::rename(&real, dir.path().join(FILE)).unwrap();
-        let found = load(dir.path(), &[dir.path().to_path_buf()], &[]);
+        let found = load_test(dir.path(), &[dir.path().to_path_buf()], &[]);
         assert!(
             found.specs.is_empty() && found.rejected[0].reason.contains("writable in the sandbox")
         );
         assert!(
-            load(&dir.path().join("missing"), &[], &[])
+            load_test(&dir.path().join("missing"), &[], &[])
                 .rejected
                 .is_empty()
         );
@@ -641,15 +657,12 @@ mod tests {
     fn file_level_write_grants_and_policy_rejections() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join(FILE);
-        // `sh`, not `nais`: load resolves the command in the real trusted
-        // dirs, and CI has no nais.
-        let none = with(base(), "/credential", json!("none"));
-        std::fs::write(&f, spec_json(with(none, "/command", json!(["sh"])))).unwrap();
-        let found = load(dir.path(), std::slice::from_ref(&f), &[]);
+        std::fs::write(&f, spec_json(base())).unwrap();
+        let found = load_test(dir.path(), std::slice::from_ref(&f), &[]);
         assert!(
             found.specs.is_empty() && found.rejected[0].reason.contains("writable in the sandbox")
         );
-        let mut found = load(dir.path(), &[], &[]);
+        let mut found = load_test(dir.path(), &[], &[]);
         assert_eq!(found.specs.len(), 1);
         assert_eq!(found.specs[0].file, f);
         drop_writable(&mut found, |p| (p == f).then(|| PathBuf::from("/grant")));
@@ -671,13 +684,8 @@ mod tests {
     #[test]
     fn the_fix_matches_the_cause() {
         let dir = tempfile::tempdir().unwrap();
-        let none = with(base(), "/credential", json!("none"));
-        std::fs::write(
-            dir.path().join(FILE),
-            spec_json(with(none, "/command", json!(["sh"]))),
-        )
-        .unwrap();
-        let r = &load(dir.path(), &[dir.path().to_path_buf()], &[]).rejected[0];
+        std::fs::write(dir.path().join(FILE), spec_json(base())).unwrap();
+        let r = &load_test(dir.path(), &[dir.path().to_path_buf()], &[]).rejected[0];
         assert!(r.fix.starts_with("move XDG_CONFIG_HOME"), "{r:?}");
         assert!(
             r.fix
@@ -688,14 +696,14 @@ mod tests {
         let link = tempfile::tempdir().unwrap();
         let ln = link.path().join("mcp");
         std::os::unix::fs::symlink(dir.path(), &ln).unwrap();
-        let r = &load(&ln, &[], &[]).rejected[0];
+        let r = &load_test(&ln, &[], &[]).rejected[0];
         assert!(
             r.fix.starts_with("replace the symlink") && r.fix.contains("real directory"),
             "{r:?}"
         );
         // A bad spec is still nav-pilot's to rewrite.
         std::fs::write(dir.path().join(FILE), "{").unwrap();
-        let r = &load(dir.path(), &[], &[]).rejected[0];
+        let r = &load_test(dir.path(), &[], &[]).rejected[0];
         assert_eq!(r.fix, "nav-pilot mcp enable io.github.nais/nais-mcp");
     }
 }

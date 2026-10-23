@@ -491,11 +491,17 @@ mod tests {
         kill(&c); // already reaped: returns at once, no signal
         // SIGTERM ignored: SIGKILL after the grace.
         #[allow(clippy::disallowed_methods)]
-        let c = Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; sleep 30"])
+        let mut c = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        // Readiness, not a sleep: the trap is set once "ready" is printed.
+        let mut l = String::new();
+        BufReader::new(c.stdout.take().unwrap())
+            .read_line(&mut l)
+            .unwrap();
+        assert_eq!(l, "ready\n");
         let c = Mutex::new(c);
         kill(&c);
         assert!(matches!(c.lock().unwrap().try_wait(), Ok(Some(_))));
