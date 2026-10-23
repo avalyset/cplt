@@ -103,3 +103,18 @@ pub fn warn(msg: &str) {
 pub fn error(msg: &str) {
     eprintln!("{}[cplt]{} {msg}", color(RED), color(RESET));
 }
+
+// ── Verbosity (output policy, CONTRIBUTING.md) ─────────────────
+
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once from `--verbose`: show detail-tier output (full tables, full
+/// post-session report).
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether detail-tier output was asked for.
+pub fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}

@@ -29,6 +29,17 @@ Contributions are welcome. For a large change, open an issue first to discuss th
 
 The hooks run formatting and Clippy checks before commits. `mise run check` runs formatting, Clippy, unit and library tests, and the offline probe checks.
 
+## Output policy
+
+Every line cplt prints at launch or exit belongs to one of four tiers. Pick the tier before you add a line.
+
+- **Act now:** always shown, kept short. The user has to do something, or there is a risk. Examples: untrusted `.cplt.toml` keys, `⚠ GPG signing allowed`, a refused launch.
+- **Changed:** shown once when something changed since the last launch in this project, then silent. `src/launch_state.rs` records what was shown. The sandbox table and the nested-repo hint work this way.
+- **Steady state:** silent, or one summary line at most.
+- **Detail:** only on request: `--verbose`, `--print-profile` or `cplt doctor`.
+
+`--quiet` and `sandbox.quiet` still hide everything but the act-now tier.
+
 ## Pull requests
 
 Create a branch for your change, push it to your fork, and open a pull request against `navikt/cplt`. Maintainers will review it and help get it ready to merge.

@@ -41,12 +41,13 @@ mod tests {
     }
 
     fn command(project: &tempfile::TempDir) -> Command {
+        // --verbose: these tests read the full network report (detail tier).
         let mut command = cplt_cmd();
         command
             .current_dir(project.path())
             .env("SHELL", "/bin/sh")
             .env("NO_COLOR", "1")
-            .args(["--yes", "--no-validate", "--agent", "shell"]);
+            .args(["--yes", "--verbose", "--no-validate", "--agent", "shell"]);
         command
     }
 

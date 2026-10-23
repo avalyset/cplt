@@ -694,6 +694,12 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_audit: bool,
 
+    /// Show the full sandbox configuration table and the full post-session
+    /// report. By default cplt prints the table only when it changed since the
+    /// last launch in this project, and a short report after the session.
+    #[arg(long)]
+    verbose: bool,
+
     // --- Copilot pass-through flags ---
     // These are forwarded directly to the copilot process for convenience,
     // avoiding the need for -- when using common session-level flags.
@@ -1622,7 +1628,7 @@ const CONFIRM_PROMPT: &str =
 /// if no TTY is available without --yes.
 fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     if auto_yes {
-        if !quiet {
+        if !quiet && ui::verbose() {
             ui::info("Auto-confirmed (--yes)");
         }
         return Ok(());
@@ -1943,7 +1949,8 @@ fn warn_worktrees_not_audited(
             details.join("\n    ")
         ));
     }
-    if let (true, Some(root)) = (audit_enabled, worktree_root) {
+    // Detail tier: the table already names the worktree root as persisting.
+    if let (true, Some(root)) = (audit_enabled && ui::verbose(), worktree_root) {
         ui::warn(&format!(
             "The audit above does not cover worktrees under {}. Review them there \
              (`git worktree list` from this repository).",
@@ -2699,9 +2706,20 @@ fn unlinked_child_repos_messages(project_dir: &Path, named_roots: &[PathBuf]) ->
     )]
 }
 
-fn warn_unlinked_child_repos(project_dir: &Path, named_roots: &[PathBuf]) {
-    for message in unlinked_child_repos_messages(project_dir, named_roots) {
-        ui::warn(&message);
+fn warn_unlinked_child_repos(home_dir: &Path, project_dir: &Path, named_roots: &[PathBuf]) {
+    // A hint, not a risk: shown once per set of unlinked repos (output policy).
+    // An empty set is recorded too, so a repo that comes back shows again.
+    let messages = unlinked_child_repos_messages(project_dir, named_roots);
+    // Fingerprint the whole sorted set: the message lists only the first few.
+    let mut set: Vec<String> = unlinked_child_repos(project_dir, named_roots)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    set.sort();
+    if cplt::launch_state::changed(home_dir, project_dir, "nested", &set.join("\n")) {
+        for message in messages {
+            ui::warn(&message);
+        }
     }
 }
 
@@ -2984,7 +3002,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     }
                     _ => "",
                 };
-                ui::info(&format!("Repo config: .cplt.toml{source_note}"));
+                if ui::verbose() {
+                    ui::info(&format!("Repo config: .cplt.toml{source_note}"));
+                }
             }
             warn_unknown_repo_config_keys(&loaded.config, ".cplt.toml");
             warn_glob_like_deny_paths(
@@ -3327,17 +3347,21 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             }
         }
         eprintln!(
-            "  {}Approve:{} cplt trust accept --all  (or select specific keys)",
+            "  {}Approve:{} cplt trust accept --all",
             ui::color(ui::DIM),
             ui::color(ui::RESET),
         );
     }
 
-    if !resolved.quiet {
+    if !resolved.quiet && ui::verbose() {
         ui::info(&format!("Project:  {}", project_dir.display()));
         if let Some(ref cp) = config_path {
             ui::info(&format!("Config:   {}", cp.display()));
         }
+    }
+    // Not detail tier: a per-project override in force is easy to forget, so
+    // it gets its line whenever the layer applies (still hidden by --quiet).
+    if !resolved.quiet {
         // Only when a local file was actually APPLIED. A missing one, or one
         // whose recorded remote no longer matches, leaves `local_cfg` None and
         // must not claim a layer that did nothing.
@@ -3401,7 +3425,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         },
     };
 
-    if !resolved.quiet {
+    if !resolved.quiet && ui::verbose() {
         ui::info(&format!("Agent:    {}", active_agent.display_name()));
     }
 
@@ -4243,7 +4267,7 @@ fn start_proxy_if_enabled(
     }) {
         Ok(handle) => {
             resolved.proxy_port = handle.port;
-            if !resolved.quiet {
+            if !resolved.quiet && ui::verbose() {
                 ui::ok(&format!(
                     "Proxy running on localhost:{} (thread)",
                     handle.port
@@ -4414,6 +4438,7 @@ fn resolve_config_only() -> anyhow::Result<config::Resolved> {
 }
 
 fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
+    ui::set_verbose(cli.verbose);
     // Handle --init-config
     if cli.init_config {
         return Ok(init_config());
@@ -4690,7 +4715,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     warn_repo_under_no_exec_cache(&resolved, &home_dir, &project_dir, &repo_paths);
     warn_inject_token_without_guard(&resolved, active_agent);
     if !resolved.quiet {
-        warn_unlinked_child_repos(&project_dir, &repo_paths);
+        warn_unlinked_child_repos(&home_dir, &project_dir, &repo_paths);
     }
 
     // Probe the host for everything the sandbox profile depends on.
@@ -4936,7 +4961,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
             Ok(()) => {
-                if !resolved.quiet {
+                if !resolved.quiet && ui::verbose() {
                     print_preflight_ok();
                 }
             }
@@ -4953,6 +4978,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
+            cli.verbose || cli.print_profile || !resolved.yes,
         );
     } else if !unapproved_proposals.is_empty() {
         ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
@@ -5013,6 +5039,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let banner = std::sync::Once::new();
     let print_banner = || {
         banner.call_once(|| {
+            // Detail tier (output policy): the summary line already names the agent.
+            if !ui::verbose() {
+                return;
+            }
             ui::ok(&format!(
                 "Starting {} in sandbox...",
                 active_agent.display_name()
@@ -7042,6 +7072,7 @@ fn run_exec_command(
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
+            cli.verbose || cli.print_profile || !resolved.yes,
         );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {

@@ -140,7 +140,7 @@ mod e2e_tests {
         // and the agent launching is agent-agnostic, so this runs in CI.
         let (mut cmd, _fake) = cplt_cmd_with_fake_copilot();
         let output = cmd
-            .args(["--yes", "--", "--version"])
+            .args(["--yes", "--verbose", "--", "--version"])
             .output()
             .expect("binary should run");
 
@@ -167,6 +167,7 @@ mod e2e_tests {
         let output = cmd
             .args([
                 "--yes",
+                "--verbose", // the proxy line is detail tier (output policy)
                 "--with-proxy",
                 "--proxy-port",
                 &port.to_string(),
@@ -1366,6 +1367,38 @@ mod e2e_tests {
         assert!(
             stdout.contains("GIT_TERMINAL_PROMPT=0"),
             "GIT_TERMINAL_PROMPT should be injected.\nstdout: {stdout}"
+        );
+    }
+
+    /// Output policy: the full table prints when the effective profile changed
+    /// since the last launch in this project, CLI flags included, and a single
+    /// summary line otherwise.
+    #[test]
+    fn e2e_summary_table_reprints_when_a_cli_flag_changes_the_profile() {
+        require_sandbox!();
+        let (_, fake_dir) = cplt_cmd_with_fake_copilot();
+        let home = tempfile::tempdir().unwrap();
+        let launch = |extra: &[&str]| {
+            let (mut cmd, _keep) = cplt_cmd_with_fake_copilot();
+            let out = cmd
+                .current_dir(fake_dir.path())
+                .env("HOME", home.path())
+                .args(["--yes", "--no-validate", "--no-proxy"])
+                .args(extra)
+                .args(["--", "--version"])
+                .output()
+                .expect("binary should run");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let first = launch(&[]);
+        assert!(first.contains("Sandbox Configuration"), "{first}");
+        let second = launch(&[]);
+        assert!(!second.contains("Sandbox Configuration"), "{second}");
+        assert!(second.contains("unchanged since last launch"), "{second}");
+        let third = launch(&["--allow-read", "/usr/share"]);
+        assert!(
+            third.contains("Sandbox Configuration") && third.contains("Extra read"),
+            "a new --allow-read must print the full table:\n{third}"
         );
     }
 

@@ -1108,9 +1108,11 @@ impl Resolved {
 
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
-    /// Shows ALL effective settings including defaults so the user can make
-    /// an informed decision before Copilot is launched. This is a security
-    /// tool — the sandbox boundary must never be hidden.
+    /// The full table shows every effective setting, defaults included, when
+    /// `full` is set or the table differs from the last launch of this agent in
+    /// this project. Otherwise one summary line plus every warning line: a
+    /// widened boundary is never hidden, an unchanged one is not repeated.
+    #[allow(clippy::too_many_arguments)]
     pub fn print_summary(
         &self,
         project_dir: &std::path::Path,
@@ -1119,6 +1121,7 @@ impl Resolved {
         keychain: Option<&crate::agent::KeychainSubstitute>,
         repos: &[super::types::RepoSummaryRow],
         worktree_root: Option<&std::path::Path>,
+        full: bool,
     ) {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
@@ -1126,15 +1129,28 @@ impl Resolved {
         let yellow = ui::color(ui::YELLOW);
         let nc = ui::color(ui::RESET);
 
-        eprintln!();
-        eprintln!("{blue}[cplt]{nc} ── Sandbox Configuration ─────────────────────────");
-        eprintln!();
+        // Rendered into a buffer: the full table prints only when asked for or
+        // when it differs from the last launch in this project (output policy,
+        // CONTRIBUTING.md). Otherwise one line plus every warning line.
+        let mut lines: Vec<String> = Vec::new();
+        macro_rules! out {
+            () => {
+                lines.push(String::new())
+            };
+            ($($t:tt)*) => {
+                lines.push(format!($($t)*))
+            };
+        }
+
+        out!();
+        out!("{blue}[cplt]{nc} ── Sandbox Configuration ─────────────────────────");
+        out!();
 
         if let Some(preset) = self.preset {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}  {dim}Preset:{nc}        {green}{preset}{nc}         {dim}baseline, individual flags still override{nc}"
             );
-            eprintln!();
+            out!();
         }
 
         // Repositories. Only when the session spans more than the launch repo:
@@ -1153,7 +1169,7 @@ impl Resolved {
                 .map(|r| r.path.display().to_string().len())
                 .max()
                 .unwrap_or(0);
-            eprintln!("{blue}[cplt]{nc}  {dim}Repositories:{nc}");
+            out!("{blue}[cplt]{nc}  {dim}Repositories:{nc}");
             for row in repos {
                 // The grant column is the one an operator has to read before
                 // agreeing: a sibling root is a second writable-and-executable
@@ -1165,33 +1181,33 @@ impl Resolved {
                 } else {
                     format!("   {dim}{grant}{nc}")
                 };
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    {:width$}  {:path_width$}   {dim}{}{nc}{grant}",
                     row.name,
                     row.path.display().to_string(),
                     row.source
                 );
             }
-            eprintln!();
+            out!();
         }
 
         // Filesystem
-        eprintln!("{blue}[cplt]{nc}  {dim}Filesystem:{nc}");
-        eprintln!(
+        out!("{blue}[cplt]{nc}  {dim}Filesystem:{nc}");
+        out!(
             "{blue}[cplt]{nc}    Project:       {green}read/write{nc}  {}",
             project_dir.display()
         );
         // #531: a second read/write/execute tree, and one whose contents
         // outlive the session, so both facts are on the line.
         if let Some(root) = worktree_root {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Worktrees:     {yellow}read/write/exec{nc} {}  {dim}$CPLT_WORKTREE_ROOT; worktrees and branches persist after the session{nc}",
                 root.display()
             );
         }
         if !self.allow_read.is_empty() {
             for p in &self.allow_read {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Extra read:    {green}allowed{nc}     {}",
                     p.display()
                 );
@@ -1199,7 +1215,7 @@ impl Resolved {
         }
         if !self.allow_write.is_empty() {
             for p in &self.allow_write {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Extra write:   {yellow}allowed{nc}     {}",
                     p.display()
                 );
@@ -1207,7 +1223,7 @@ impl Resolved {
         }
         if !self.allow_socket.is_empty() {
             for p in &self.allow_socket {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Socket:        {yellow}allowed{nc}     {}",
                     p.display()
                 );
@@ -1215,79 +1231,77 @@ impl Resolved {
         }
         if !self.deny_paths.is_empty() {
             for p in &self.deny_paths {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Deny:          blocked     {}",
                     p.display()
                 );
             }
         }
         if self.allow_env_files {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    .env/.pem/.key {yellow}allowed{nc}     {dim}(--allow-env-files){nc}"
             );
         } else {
-            eprintln!("{blue}[cplt]{nc}    .env/.pem/.key blocked     {dim}secrets protected{nc}");
+            out!("{blue}[cplt]{nc}    .env/.pem/.key blocked     {dim}secrets protected{nc}");
             // The NAV bootstrap shape meets three separate refusals at three
             // separate moments, and this is the first one the operator hits.
             // #434 taught `init` and `doctor` to say all three at once; saying
             // nothing here left the connection to be made by the reader. The
             // detector is asked, never re-implemented.
             if let Some(driver) = crate::detect::nais_bootstrap_driver(project_dir) {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}                   {yellow}{driver}{nc} {dim}bootstraps this repo with the nais CLI: run it outside cplt, then{nc}"
                 );
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}                   {dim}sandbox.allow_env_files = true to read the .env it wrote (`cplt doctor` has all three refusals){nc}"
                 );
             }
         }
         if self.allow_lifecycle_scripts {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Lifecycle:     {yellow}allowed{nc}     {dim}(--allow-lifecycle-scripts){nc}"
             );
         } else {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Lifecycle:     blocked     {dim}npm/yarn postinstall hooks{nc}"
             );
         }
         if !self.scratch_dir {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Scratch dir:   disabled    {dim}TMPDIR not redirected (--no-scratch-dir){nc}"
             );
         }
         if self.allow_tmp_exec {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Tmp exec:      {red}ALLOWED{nc}     {dim}⚠ /tmp + /var/folders exec enabled{nc}"
             );
         }
         if self.allow_cache_exec_any {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Cache exec:    {red}ALLOWED{nc}     {dim}⚠ all ~/Library/Caches exec enabled{nc}"
             );
         } else if !self.allow_cache_exec.is_empty() {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Cache exec:    {yellow}allowed{nc}     {dim}~/Library/Caches/{}{nc}",
                 self.allow_cache_exec.join(", ~/Library/Caches/")
             );
         }
         if self.allow_gpg_signing {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    GPG signing:   {red}ALLOWED{nc}     {dim}⚠ agent socket exposed (--allow-gpg-signing){nc}"
             );
-            eprintln!(
-                "{blue}[cplt]{nc}    SSH/cloud:     blocked     {dim}~/.ssh, ~/.aws, ...{nc}"
-            );
+            out!("{blue}[cplt]{nc}    SSH/cloud:     blocked     {dim}~/.ssh, ~/.aws, ...{nc}");
         } else {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
             );
         }
         if !self.allow_exec.is_empty() {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Exec grants:   {red}ALLOWED{nc}     {dim}\u{26a0} {} (--allow-exec){nc}",
                 self.allow_exec
                     .iter()
@@ -1298,45 +1312,43 @@ impl Resolved {
         }
         if self.allow_build_credentials {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Build creds:   {red}READABLE{nc}    {dim}\u{26a0} ~/.npmrc, ~/.gradle/gradle.properties, ~/.m2/settings.xml (sandbox.allow_build_credentials){nc}"
             );
         }
         if self.allow_docker {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Docker:        {red}ALLOWED{nc}     {dim}⚠ container mounts bypass sandbox (--allow-docker){nc}"
             );
         } else if self.allow_rootless_docker {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Docker:        {red}ROOTLESS{nc}    {dim}⚠ rootless containers run as you, outside the sandbox (--allow-rootless-docker){nc}"
             );
         }
         if self.allow_jvm_attach {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    JVM attach:    {yellow}allowed{nc}     {dim}.java_pid* sockets (--allow-jvm-attach){nc}"
             );
         }
         if self.allow_msbuild {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    MSBuild:       {yellow}allowed{nc}     {dim}MSBuild<pid> sockets (--allow-msbuild){nc}"
             );
         }
         if self.allow_browser {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Browser:       {yellow}allowed{nc}     {dim}launches any app outside the sandbox (--allow-browser){nc}"
             );
         }
         if agent.needs_copilot_dir() {
-            eprintln!(
-                "{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}"
-            );
+            out!("{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}");
         }
         #[cfg(not(target_os = "macos"))]
         if let Some(source) = keychain {
             // Linux has no Keychain grant; say which credential was handed over.
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Login:         {yellow}passed{nc}      {dim}{source} (in the agent's environment){nc}"
             );
         }
@@ -1347,7 +1359,7 @@ impl Resolved {
             if let Some(source) = keychain {
                 // The whole-Keychain grant is dropped: the agent has a
                 // credential it can reach without it (#242).
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Keychain:      {green}denied{nc}      {dim}{source} used instead{nc}"
                 );
             } else {
@@ -1360,40 +1372,38 @@ impl Resolved {
                 )
                 .map(|why| format!(" ({why})"))
                 .unwrap_or_default();
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{why}{nc}"
                 );
             }
         }
-        eprintln!(
+        out!(
             "{blue}[cplt]{nc}    GH CLI config: {green}read-only{nc}   {dim}~/.config/gh/{{hosts,config}}.yml{nc}"
         );
-        eprintln!();
+        out!();
 
         // Network
-        eprintln!("{blue}[cplt]{nc}  {dim}Network:{nc}");
+        out!("{blue}[cplt]{nc}  {dim}Network:{nc}");
         if self.allow_ports.is_empty() {
-            eprintln!(
-                "{blue}[cplt]{nc}    Outbound:      {green}443{nc}          {dim}HTTPS only{nc}"
-            );
+            out!("{blue}[cplt]{nc}    Outbound:      {green}443{nc}          {dim}HTTPS only{nc}");
         } else {
             let ports: Vec<String> = self
                 .allow_ports
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Outbound:      {green}443, {}{nc}",
                 ports.join(", ")
             );
         }
         if self.allow_localhost_any && self.allow_jvm_attach {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Localhost:     {red}ALL TCP{nc}     {dim}⚠ all outbound TCP (JVM IPv4-mapped workaround){nc}"
             );
         } else if self.allow_localhost_any {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Localhost:     {yellow}all ports{nc}   {dim}(--allow-localhost-any){nc}"
             );
         } else if !self.allow_localhost.is_empty() {
@@ -1402,12 +1412,12 @@ impl Resolved {
                 .iter()
                 .map(|p| format!(":{p}"))
                 .collect();
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Localhost:     {yellow}{}{nc}",
                 ports.join(", ")
             );
         } else {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Localhost:     blocked     {dim}use --allow-localhost <PORT>{nc}"
             );
         }
@@ -1417,79 +1427,80 @@ impl Resolved {
             } else {
                 format!("{}", self.proxy_port)
             };
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Proxy:         {green}on{nc}          {dim}localhost:{port_display}{nc}"
             );
             if self.allowed_domains.is_some() {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Allowlist:     {green}on{nc}          {dim}only listed domains + agent hosts{nc}"
                 );
             }
             if !self.allow_private_domains.is_empty() {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Private:       {yellow}allowed{nc}     {dim}{}{}",
                     self.allow_private_domains.join(", "),
                     nc
                 );
             }
             if let Some(ref up) = self.proxy_upstream {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Upstream:      {green}on{nc}          {dim}{}:{}{nc}",
-                    up.host, up.port
+                    up.host,
+                    up.port
                 );
             }
             if let Some(ref lf) = self.proxy_log_file {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Audit log:     {green}on{nc}          {dim}{}{nc}",
                     lf.display()
                 );
             }
             if self.proxy_log_level != crate::proxy::ProxyLogLevel::None {
-                eprintln!(
+                out!(
                     "{blue}[cplt]{nc}    Log level:     {green}{}{nc}",
                     self.proxy_log_level.as_str()
                 );
             }
         } else {
-            eprintln!("{blue}[cplt]{nc}    Proxy:         off         {dim}direct connections{nc}");
+            out!("{blue}[cplt]{nc}    Proxy:         off         {dim}direct connections{nc}");
         }
-        eprintln!("{blue}[cplt]{nc}    SSH agent:     blocked     {dim}use HTTPS, not SSH{nc}");
-        eprintln!();
+        out!("{blue}[cplt]{nc}    SSH agent:     blocked     {dim}use HTTPS, not SSH{nc}");
+        out!();
 
         // Environment
-        eprintln!("{blue}[cplt]{nc}  {dim}Environment:{nc}");
+        out!("{blue}[cplt]{nc}  {dim}Environment:{nc}");
         if self.inherit_env {
             let red = ui::color(ui::RED);
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Mode:          {red}INHERITED{nc}   {dim}⚠ all env vars passed (--inherit-env){nc}"
             );
         } else if !self.pass_env.is_empty() {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Mode:          {green}sanitized{nc}   {dim}allowlist + {} extra{nc}",
                 self.pass_env.len()
             );
             for var in &self.pass_env {
-                eprintln!("{blue}[cplt]{nc}    Extra:         {yellow}{var}{nc}");
+                out!("{blue}[cplt]{nc}    Extra:         {yellow}{var}{nc}");
             }
         } else {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Mode:          {green}sanitized{nc}   {dim}safe allowlist only{nc}"
             );
         }
-        eprintln!(
+        out!(
             "{blue}[cplt]{nc}    Stripped:      {dim}AWS_*, NPM_TOKEN, DATABASE_URL, SSH_AUTH_SOCK, ...{nc}"
         );
         if !self.deny_env.is_empty() {
-            eprintln!(
+            out!(
                 "{blue}[cplt]{nc}    Denied env:    {dim}{}{nc}",
                 self.deny_env.join(", ")
             );
         }
-        eprintln!();
+        out!();
 
         // Command guards
         if self.gh_guard.enabled || self.git_guard.enabled {
-            eprintln!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
+            out!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
             if self.gh_guard.enabled {
                 if self.scratch_dir {
                     let policy_note = match self.gh_guard.unknown_command {
@@ -1501,7 +1512,7 @@ impl Resolved {
                         EnforcementMode::Warn => " [WARN MODE]",
                         EnforcementMode::Audit => " [AUDIT MODE]",
                     };
-                    eprintln!(
+                    out!(
                         "{blue}[cplt]{nc}    gh guard:      {green}on{nc}          {dim}{policy_note}, scope_check={}{mode_note}{nc}",
                         if self.gh_guard.scope_check {
                             "on"
@@ -1511,7 +1522,7 @@ impl Resolved {
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);
-                    eprintln!(
+                    out!(
                         "{blue}[cplt]{nc}    gh guard:      {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
                     );
                 }
@@ -1532,35 +1543,101 @@ impl Resolved {
                     } else {
                         "blocks git push"
                     };
-                    eprintln!(
+                    out!(
                         "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}{scope_note}{mode_note}{nc}"
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);
-                    eprintln!(
+                    out!(
                         "{blue}[cplt]{nc}    git guard:     {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
                     );
                 }
             }
-            eprintln!();
+            out!();
         }
 
-        eprintln!(
+        out!(
             "{blue}[cplt]{nc}  {dim}Home:{nc}           {}",
             home_dir.display()
         );
         if self.no_validate {
-            eprintln!(
-                "{blue}[cplt]{nc}  {dim}Validation:{nc}     skipped     {dim}(--no-validate){nc}"
-            );
+            out!("{blue}[cplt]{nc}  {dim}Validation:{nc}     skipped     {dim}(--no-validate){nc}");
         }
-        eprintln!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
-        if quiet_tip_due(home_dir) {
-            eprintln!(
-                "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
-            );
+        out!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
+        out!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+
+        // Compare what the table says, not how it looks: no colour codes (a
+        // TTY and a pipe must agree), no ephemeral proxy port. The allowlist
+        // file's mtime counts, since its content is not in the table.
+        let port = format!("localhost:{}", self.proxy_port);
+        let mut stable: Vec<String> = lines
+            .iter()
+            .map(|l| strip_ansi(l).replace(&port, "localhost:PORT"))
+            .collect();
+        stable.push(agent.display_name().to_string());
+        if let Some(path) = &self.allowed_domains {
+            let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            stable.push(format!("{} {mtime:?}", path.display()));
         }
-        eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+        let topic = format!("summary-{}", agent.display_name());
+        let changed =
+            crate::launch_state::changed(home_dir, project_dir, &topic, &stable.join("\n"));
+        if full || changed {
+            for line in &lines {
+                eprintln!("{line}");
+            }
+            if quiet_tip_due(home_dir) {
+                eprintln!(
+                    "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
+                );
+            }
+            return;
+        }
+        eprintln!(
+            "{blue}[cplt]{nc} {}",
+            self.summary_line(agent, repos.len(), worktree_root.is_some())
+        );
+        for line in lines.iter().filter(|l| l.contains('\u{26a0}')) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The one-line steady-state summary: repositories, writable paths,
+    /// network and guards. The table stays behind `--verbose`.
+    fn summary_line(&self, agent: crate::agent::Agent, repos: usize, worktrees: bool) -> String {
+        let mut write = vec!["project".to_string()];
+        if worktrees {
+            write.push("worktrees".into());
+        }
+        if !self.allow_write.is_empty() {
+            write.push(format!("{} extra", self.allow_write.len()));
+        }
+        let mut ports = vec!["443".to_string()];
+        ports.extend(self.allow_ports.iter().map(u16::to_string));
+        let proxy = match (self.with_proxy, self.allowed_domains.is_some()) {
+            (false, _) => "direct, no proxy",
+            (true, false) => "via proxy",
+            (true, true) => "via proxy + allowlist",
+        };
+        let guards: Vec<&str> = [
+            (self.gh_guard.enabled && self.scratch_dir, "gh"),
+            (self.git_guard.enabled && self.scratch_dir, "git"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        let guards = if guards.is_empty() {
+            "none".to_string()
+        } else {
+            guards.join("+")
+        };
+        format!(
+            "Sandbox for {}: {repos} repo{} · write: {} · network: {} {proxy} · guards: {guards} · unchanged since last launch (--verbose shows the table)",
+            agent.display_name(),
+            if repos == 1 { "" } else { "s" },
+            write.join(", "),
+            ports.join(",")
+        )
     }
 
     /// Apply per-repo config (.cplt.toml) to the resolved configuration.
@@ -1847,6 +1924,24 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
         return None;
     }
     Some(resolved)
+}
+
+/// Drop ANSI SGR sequences (`ESC [ ... m`), the only ones `ui` emits.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Launches that still show the `--quiet` tip (#666).

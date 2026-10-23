@@ -628,7 +628,11 @@ impl Baseline {
 
 impl AuditReport {
     /// The launch repository's report: the session line, then the body.
-    pub fn print(&self) {
+    ///
+    /// `unaudited` counts writable paths outside the project. In the one-line
+    /// form they are folded into the line and `true` is returned; otherwise the
+    /// caller prints the full warning.
+    pub fn print(&self, unaudited: usize) -> bool {
         let (duration, exit_code) = match self {
             AuditReport::Unavailable {
                 duration,
@@ -644,11 +648,67 @@ impl AuditReport {
                 ..
             } => (duration, exit_code),
         };
-        ui::info(&format!(
+        let ended = format!(
             "Session ended (exit {exit_code}, {})",
             human_duration(*duration)
-        ));
+        );
+        // Steady state (output policy): one line, plus any sensitive file as
+        // an act-now line. The per-file list is behind --verbose.
+        if !ui::verbose()
+            && let Some(count) = self.brief_count()
+        {
+            let unaudited = match unaudited {
+                0 => String::new(),
+                1 => " · 1 writable path NOT audited (--verbose)".to_string(),
+                n => format!(" · {n} writable paths NOT audited (--verbose)"),
+            };
+            ui::info(&format!(
+                "{ended} · {}{unaudited}",
+                count.as_deref().map_or_else(
+                    || "no project file changes".to_string(),
+                    |c| format!("project changes: {c}")
+                )
+            ));
+            self.print_sensitive();
+            return true;
+        }
+        ui::info(&ended);
         self.print_body(None);
+        false
+    }
+
+    /// `Some(None)` for a clean audited report, `Some(Some("3 files (+1 -2)"))`
+    /// for one with changes, `None` when the full body must print (it carries
+    /// a warning).
+    #[allow(clippy::option_option)]
+    fn brief_count(&self) -> Option<Option<String>> {
+        let AuditReport::Available {
+            changes,
+            total_added,
+            total_deleted,
+            tracked_audited: true,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((!changes.is_empty()).then(|| {
+            format!(
+                "{} file{} (+{total_added} -{total_deleted})",
+                changes.len(),
+                if changes.len() == 1 { "" } else { "s" },
+            )
+        }))
+    }
+
+    fn print_sensitive(&self) {
+        if let AuditReport::Available { changes, .. } = self {
+            for c in changes {
+                if let Some(reason) = c.sensitive {
+                    ui::warn(&format!("  {}{}  ⚠️  {reason}", c.path, format_counts(c)));
+                }
+            }
+        }
     }
 
     /// One named repository's report.
@@ -662,7 +722,17 @@ impl AuditReport {
     /// the directory name is chosen by whoever created it — the audit's own
     /// output must not be forgeable from a path.
     pub fn print_named(&self, dir: &Path) {
-        self.print_body(Some(&escape_path(&dir.display().to_string())));
+        let path = escape_path(&dir.display().to_string());
+        if !ui::verbose()
+            && let Some(count) = self.brief_count()
+        {
+            if let Some(count) = count {
+                ui::info(&format!("Changes in {path}: {count}"));
+                self.print_sensitive();
+            }
+            return;
+        }
+        self.print_body(Some(&path));
     }
 
     /// The report itself. `root` is `None` for the launch repository, whose
@@ -878,6 +948,40 @@ pub fn write_network_report<W: Write>(
         "[cplt] Excludes application requests, kernel-denied attempts, DNS, UDP, inbound traffic, delegated services, and activity after the cutoff."
     )?;
     Ok(())
+}
+
+/// The steady-state network line: nothing for a clean session with no blocked
+/// host, one line naming blocked hosts otherwise. Returns `false` (wrote
+/// nothing) when the snapshot is partial or failed, so the caller prints the
+/// full report: that one needs attention.
+pub fn write_network_brief<W: Write>(
+    writer: &mut W,
+    snapshot: Option<&proxy::ProxySnapshot>,
+) -> io::Result<bool> {
+    let Some(snapshot) = snapshot else {
+        return Ok(true);
+    };
+    if snapshot.availability != proxy::SnapshotAvailability::Available
+        || snapshot.completion != proxy::SnapshotCompletion::Settled
+        || snapshot.integrity != proxy::SnapshotIntegrity::default()
+        || snapshot.unretained_observations > 0
+    {
+        return Ok(false);
+    }
+    let blocked: Vec<String> = snapshot
+        .domains
+        .iter()
+        .filter(|entry| entry.verdict == proxy::DomainVerdict::Blocked)
+        .map(|entry| escape_path(&entry.host))
+        .collect();
+    if !blocked.is_empty() {
+        writeln!(
+            writer,
+            "[cplt] Blocked hosts: {} (--verbose for the network report)",
+            blocked.join(", ")
+        )?;
+    }
+    Ok(true)
 }
 
 /// Write collection, completion, and integrity status for one proxy snapshot.
@@ -2473,17 +2577,18 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     if let Some(baseline) = baseline {
         let mut report = baseline.finish_at(exit_code, settled, project_audit_finished_at);
         report.drop_named_roots(project_dir, named_roots);
-        report.print();
+        let unaudited = unaudited_roots(project_dir, allow_write);
+        let folded = report.print(unaudited.len());
         for (dir, baseline) in named {
             baseline
                 .finish_at(exit_code, settled, project_audit_finished_at)
                 .print_named(&dir);
         }
         let mut stderr = io::stderr().lock();
-        let _ = write_network_report(&mut stderr, snapshot.as_ref(), routing);
-        if let Some(line) =
-            unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write))
-        {
+        if ui::verbose() || !write_network_brief(&mut stderr, snapshot.as_ref()).unwrap_or(false) {
+            let _ = write_network_report(&mut stderr, snapshot.as_ref(), routing);
+        }
+        if !folded && let Some(line) = unaudited_warning(project_dir, &unaudited) {
             ui::warn(&line);
         }
     }
