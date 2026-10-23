@@ -472,6 +472,7 @@ impl Config {
                 super::types::ProxyConfig {
                     enabled: _,
                     forced: _,
+                    inject_github_token: _,
                     port: _,
                     blocked_domains: _,
                     allowed_domains: _,
@@ -574,6 +575,7 @@ impl Config {
             local.proxy,
             enabled,
             forced,
+            inject_github_token,
             port,
             blocked_domains,
             allowed_domains,

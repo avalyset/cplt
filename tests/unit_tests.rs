@@ -10087,6 +10087,7 @@ fn registry_keys_match_validate_all_valid_keys_fixture() {
 [proxy]
 enabled = false
 forced = false
+inject_github_token = false
 port = 18080
 upstream = "http://corp-proxy.example.com:8080"
 upstream_no_proxy = []

@@ -1103,6 +1103,37 @@ Turn it off with `sandbox.github_mcp_proxy = false`, or for one run with
 `--no-github-mcp-proxy`. `deny.env` naming `GH_TOKEN` or
 `OPENCODE_CONFIG_CONTENT` turns it off too.
 
+## GitHub token injection (`proxy.inject_github_token`)
+
+Off by default. With `proxy.inject_github_token = true`, or
+`--inject-github-token` for one run, the agent gets a placeholder instead of
+your GitHub token, and cplt's proxy puts the real token back on the way out.
+A token read inside the sandbox is then useless anywhere else.
+
+- The placeholder has the same prefix and length as the real token
+  (`gho_…`, `github_pat_…`). It replaces the token in `GH_TOKEN`,
+  `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `OPENCODE_AUTH_CONTENT` and the gh
+  guard's token files.
+- For `api.github.com`, `github.com` and `*.githubcopilot.com` on port 443, the
+  proxy terminates TLS with a CA created in memory for this session. It swaps
+  the placeholder for the real token in the `Authorization` header (`Bearer`,
+  `token`, or `Basic` where the password is the placeholder) and connects
+  upstream itself. Every other host keeps the plain tunnel.
+- The token is never added on the GitHub MCP paths (`/mcp…` on the Copilot
+  hosts), which `sandbox.github_mcp_proxy` handles, or on `TRACE`.
+- The CA certificate goes into bundles in the scratch dir. `SSL_CERT_FILE` and
+  `GIT_SSL_CAINFO` point at the system roots plus any CA already named in
+  `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` or `GIT_SSL_CAINFO`, plus cplt's CA.
+  `NODE_EXTRA_CA_CERTS` gets your CA plus cplt's. A corporate CA keeps working.
+
+It needs the proxy and the scratch dir. If any step fails, cplt prints one line
+and the agent gets the real token as before.
+
+Not covered yet: gh's `hosts.yml` stays readable, so a token stored there (Linux
+without a keyring, or insecure storage) is still reachable; GitHub Enterprise
+hosts; and the agent can still use the token through the proxy against the
+GitHub hosts above. The default will flip separately.
+
 ## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`) — EXPERIMENTAL
 
 > **EXPERIMENTAL.** Both keys, and the `--brief` / `--no-brief` /
