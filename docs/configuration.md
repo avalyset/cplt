@@ -1103,6 +1103,39 @@ Turn it off with `sandbox.github_mcp_proxy = false`, or for one run with
 `--no-github-mcp-proxy`. `deny.env` naming `GH_TOKEN` or
 `OPENCODE_CONFIG_CONTENT` turns it off too.
 
+## Brokered MCP servers (`sandbox.mcp_broker`)
+
+Some local MCP servers need a host login the sandbox does not grant. `nais
+alpha mcp serve`, for one, reads the macOS login keychain. For each such
+server, nav-pilot writes a broker spec to `~/.config/cplt/mcp/` (or
+`$XDG_CONFIG_HOME/cplt/mcp/`): the server's `server.json` plus a
+`_meta["io.github.navikt/broker"]` block. On macOS cplt then runs the server
+on the host, outside the sandbox, and points your client's entry at
+`cplt mcp-stdio <id>`, which connects to it over a per-session socket.
+
+- The server gets a cleared environment. Its traffic goes through a proxy of
+  its own that allows only the spec's `egressHosts` on port 443. The agent's
+  allowlist does not change.
+- Only the tools in the spec's `tools.allow` are listed or callable. For
+  `execute_graphql`, cplt refuses mutations, subscriptions and documents with
+  more than one operation.
+- Copilot CLI gets `--additional-mcp-config` with an entry named exactly the
+  server id (`io.github.nais/nais-mcp`), so a "Registry only" MCP policy
+  still allows it, and `--disable-mcp-server` for your own entries that run
+  the same command under another name. An entry of yours with exactly the id
+  as its name is not disabled (that would turn off cplt's too); cplt relies on
+  `--additional-mcp-config` taking precedence over it, which Copilot does not
+  document. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
+  Your config files are not changed.
+- A spec cplt refuses prints one line at launch, and the entry stays as
+  configured. `cplt mcp status --json`, run in the project, lists the specs, their
+  state and the reasons for any refusal, checked as a launch there would.
+
+With no spec files nothing changes. Turn the broker off with
+`sandbox.mcp_broker = false`, or turn off one server for a run with
+`--no-mcp-broker <id>`. Linux is not supported yet: cplt says so at launch and
+leaves the entries as configured.
+
 ## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`) — EXPERIMENTAL
 
 > **EXPERIMENTAL.** Both keys, and the `--brief` / `--no-brief` /

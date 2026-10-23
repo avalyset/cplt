@@ -19,6 +19,7 @@ pub mod github_mcp;
 pub mod gradle_init;
 pub mod init;
 pub mod link;
+pub mod mcp_broker;
 pub mod opencode_v2;
 pub mod proxy;
 pub mod repo_config;

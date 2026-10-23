@@ -170,6 +170,10 @@ pub fn default_config_contents() -> String {
 # host-side read-only proxy holding your gh login (default: true).
 # github_mcp_proxy = true
 #
+# Run local MCP servers that have a broker spec in ~/.config/cplt/mcp/ on the
+# host behind cplt's tool policy (default: true; macOS only).
+# mcp_broker = true
+#
 # EXPERIMENTAL (unstable, may be removed): also inject the managed cplt sandbox
 # block into the project's AGENTS.md on every launch (default: false). Requires
 # brief = true, and writes into your repo — review and commit it yourself.

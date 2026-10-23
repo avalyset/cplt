@@ -1225,7 +1225,7 @@ fn handle_connection(
 /// few hundred bytes; 8 KiB matches the old single-read buffer.
 const MAX_REQUEST_HEAD: usize = 8192;
 
-enum HeadError {
+pub(crate) enum HeadError {
     /// EOF or a read error before the head was complete.
     Closed,
     TooLarge,
@@ -1240,7 +1240,10 @@ enum HeadError {
 /// in the socket for the relay. The whole head must arrive within `timeout`,
 /// not just each segment, so a client trickling bytes cannot hold a
 /// connection slot open.
-fn read_request_head(client: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>, HeadError> {
+pub(crate) fn read_request_head(
+    client: &mut TcpStream,
+    timeout: Duration,
+) -> Result<Vec<u8>, HeadError> {
     // `proxy.timeout` is an unbounded number of seconds; a huge one would
     // overflow `Instant` and panic.
     let now = Instant::now();
@@ -2010,7 +2013,7 @@ fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
     }
 }
 
-fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
+pub(crate) fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
     relay_with_ceiling(client, remote, timeout, RELAY_IDLE_TIMEOUT);
 }
 

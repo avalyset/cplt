@@ -814,6 +814,7 @@ fn landlock_policy_device_files_have_ioctl() {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -2509,6 +2510,7 @@ fn a_named_root_is_granted_read_write_and_execute() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2567,6 +2569,36 @@ fn the_worktree_broker_socket_is_one_exact_outbound_rule_when_set() {
     );
 }
 
+/// #824 MCP broker: the same one exact outbound rule, with its directory
+/// pinned, and nothing at all without a broker.
+#[test]
+fn the_mcp_broker_socket_is_one_exact_outbound_rule_when_set() {
+    let socket = PathBuf::from("/private/tmp/cplt-pw-0123456789abcdef/m");
+    let profile = |sock: Option<&std::path::Path>| {
+        generate_profile(
+            &SandboxConfig {
+                mcp_socket: sock,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+    let off = profile(None);
+    assert!(!off.contains("cplt mcp-stdio"), "{off}");
+    let on = profile(Some(&socket));
+    let block = format!(
+        ";; MCP broker socket (cplt mcp-stdio, #824)\n(allow network-outbound (remote unix-socket (path-literal \"{}\")))\n(deny file-write* (subpath \"{}\"))\n\n",
+        socket.display(),
+        socket.parent().unwrap().display()
+    );
+    assert_eq!(on.matches(&block).count(), 1, "{on}");
+    assert_eq!(
+        on.replace(&block, ""),
+        off,
+        "the block is the whole difference"
+    );
+}
+
 /// #531: the managed worktree root section, with the `.git` create denies of
 /// the #574 re-review, appears only when the root is set.
 #[test]
@@ -2580,6 +2612,7 @@ fn the_managed_worktree_root_section_is_emitted_only_when_set() {
                 named_root_git_dirs: &[],
                 managed_worktree_root: managed,
                 worktree_socket: None,
+                mcp_socket: None,
                 ..base_profile_options()
             },
             &[],
@@ -2612,6 +2645,7 @@ fn a_named_root_carries_the_protected_paths() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2639,6 +2673,7 @@ fn an_allow_write_over_a_named_roots_parent_does_not_take_its_execute_back() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             extra_write: &write,
             ..base_profile_options()
         },
@@ -2667,6 +2702,7 @@ fn the_landlock_model_grants_a_named_root_the_project_access() {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2695,6 +2731,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
             named_root_git_dirs: &gitdirs,
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -2711,6 +2748,7 @@ fn a_named_roots_shared_gitdir_is_granted() {
         named_root_git_dirs: &gitdirs,
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         ..base_profile_options()
     });
     let rule = policy
@@ -2740,6 +2778,7 @@ fn base_profile_options() -> SandboxConfig<'static> {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4349,6 +4388,7 @@ fn allow_localhost_any_affects_both_backends() {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &[],
@@ -4420,6 +4460,7 @@ fn config_options_parity_across_backends() {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
         extra_ports: &ports,
@@ -7328,6 +7369,7 @@ fn profile_gpg_signing_deny_path_wins() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             allow_gpg_signing: true,
             ..base_profile_options()
         },
@@ -8413,6 +8455,7 @@ fn profile_docker_withholds_the_overlapping_reallow() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             allow_docker: true,
             allow_rootless_docker: false,
             ..base_profile_options()
@@ -8604,6 +8647,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             ..base_profile_options()
         },
         &[],
@@ -10116,6 +10160,7 @@ preset = "standard"
 validate = true
 brief = false
 github_mcp_proxy = true
+mcp_broker = true
 agents_md = false
 allow_env_files = false
 allow_localhost_any = false
@@ -10598,6 +10643,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         named_root_git_dirs: &[],
         managed_worktree_root: None,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: Some(&dirs),
         existing_app_dirs: None,
         extra_ports: &[],
