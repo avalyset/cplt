@@ -1107,9 +1107,10 @@ impl Resolved {
 
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
-    /// Shows ALL effective settings including defaults so the user can make
-    /// an informed decision before Copilot is launched. This is a security
-    /// tool — the sandbox boundary must never be hidden.
+    /// The full table shows every effective setting, defaults included, when
+    /// `full` is set or the table differs from the last launch of this agent in
+    /// this project. Otherwise one summary line plus every warning line: a
+    /// widened boundary is never hidden, an unchanged one is not repeated.
     #[allow(clippy::too_many_arguments)]
     pub fn print_summary(
         &self,
@@ -1564,15 +1565,22 @@ impl Resolved {
         out!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
         out!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 
-        // The proxy line carries this run's ephemeral port; leave it out of
-        // the comparison or every launch reads as changed.
-        let stable: Vec<&str> = lines
+        // Compare what the table says, not how it looks: no colour codes (a
+        // TTY and a pipe must agree), no ephemeral proxy port. The allowlist
+        // file's mtime counts, since its content is not in the table.
+        let port = format!("localhost:{}", self.proxy_port);
+        let mut stable: Vec<String> = lines
             .iter()
-            .map(String::as_str)
-            .filter(|l| !l.contains("Proxy:"))
+            .map(|l| strip_ansi(l).replace(&port, "localhost:PORT"))
             .collect();
+        stable.push(agent.display_name().to_string());
+        if let Some(path) = &self.allowed_domains {
+            let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            stable.push(format!("{} {mtime:?}", path.display()));
+        }
+        let topic = format!("summary-{}", agent.display_name());
         let changed =
-            crate::launch_state::changed(home_dir, project_dir, "summary", &stable.join("\n"));
+            crate::launch_state::changed(home_dir, project_dir, &topic, &stable.join("\n"));
         if full || changed {
             for line in &lines {
                 eprintln!("{line}");
@@ -1606,9 +1614,9 @@ impl Resolved {
         let mut ports = vec!["443".to_string()];
         ports.extend(self.allow_ports.iter().map(u16::to_string));
         let proxy = match (self.with_proxy, self.allowed_domains.is_some()) {
-            (false, _) => "no proxy",
-            (true, false) => "proxy",
-            (true, true) => "proxy + allowlist",
+            (false, _) => "direct, no proxy",
+            (true, false) => "via proxy",
+            (true, true) => "via proxy + allowlist",
         };
         let guards: Vec<&str> = [
             (self.gh_guard.enabled && self.scratch_dir, "gh"),
@@ -1623,7 +1631,7 @@ impl Resolved {
             guards.join("+")
         };
         format!(
-            "Sandbox for {}: {repos} repo{} · write: {} · network: {}, {proxy} · guards: {guards} · unchanged since last launch (--verbose shows the table)",
+            "Sandbox for {}: {repos} repo{} · write: {} · network: {} {proxy} · guards: {guards} · unchanged since last launch (--verbose shows the table)",
             agent.display_name(),
             if repos == 1 { "" } else { "s" },
             write.join(", "),
@@ -1915,6 +1923,24 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
         return None;
     }
     Some(resolved)
+}
+
+/// Drop ANSI SGR sequences (`ESC [ ... m`), the only ones `ui` emits.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Launches that still show the `--quiet` tip (#666).

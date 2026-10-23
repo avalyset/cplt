@@ -628,7 +628,11 @@ impl Baseline {
 
 impl AuditReport {
     /// The launch repository's report: the session line, then the body.
-    pub fn print(&self) {
+    ///
+    /// `unaudited` counts writable paths outside the project. In the one-line
+    /// form they are folded into the line and `true` is returned; otherwise the
+    /// caller prints the full warning.
+    pub fn print(&self, unaudited: usize) -> bool {
         let (duration, exit_code) = match self {
             AuditReport::Unavailable {
                 duration,
@@ -653,18 +657,24 @@ impl AuditReport {
         if !ui::verbose()
             && let Some(count) = self.brief_count()
         {
+            let unaudited = match unaudited {
+                0 => String::new(),
+                1 => " · 1 writable path NOT audited (--verbose)".to_string(),
+                n => format!(" · {n} writable paths NOT audited (--verbose)"),
+            };
             ui::info(&format!(
-                "{ended} · {}",
+                "{ended} · {}{unaudited}",
                 count.as_deref().map_or_else(
                     || "no project file changes".to_string(),
                     |c| format!("project changes: {c}")
                 )
             ));
             self.print_sensitive();
-            return;
+            return true;
         }
         ui::info(&ended);
         self.print_body(None);
+        false
     }
 
     /// `Some(None)` for a clean audited report, `Some(Some("3 files (+1 -2)"))`
@@ -2566,22 +2576,19 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
     if let Some(baseline) = baseline {
         let mut report = baseline.finish_at(exit_code, settled, project_audit_finished_at);
         report.drop_named_roots(project_dir, named_roots);
-        report.print();
+        let unaudited = unaudited_roots(project_dir, allow_write);
+        let folded = report.print(unaudited.len());
         for (dir, baseline) in named {
             baseline
                 .finish_at(exit_code, settled, project_audit_finished_at)
                 .print_named(&dir);
         }
         let mut stderr = io::stderr().lock();
-        if ui::verbose() {
+        if ui::verbose() || !write_network_brief(&mut stderr, snapshot.as_ref()).unwrap_or(false) {
             let _ = write_network_report(&mut stderr, snapshot.as_ref(), routing);
-            if let Some(line) =
-                unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write))
-            {
-                ui::warn(&line);
-            }
-        } else if !write_network_brief(&mut stderr, snapshot.as_ref()).unwrap_or(false) {
-            let _ = write_network_report(&mut stderr, snapshot.as_ref(), routing);
+        }
+        if !folded && let Some(line) = unaudited_warning(project_dir, &unaudited) {
+            ui::warn(&line);
         }
     }
     if let Some(line) = mode.unsettled_warning().filter(|_| !settled) {

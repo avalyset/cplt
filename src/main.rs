@@ -3326,6 +3326,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         if let Some(ref cp) = config_path {
             ui::info(&format!("Config:   {}", cp.display()));
         }
+    }
+    // Not detail tier: a per-project override in force is easy to forget, so
+    // it gets its line whenever the layer applies (still hidden by --quiet).
+    if !resolved.quiet {
         // Only when a local file was actually APPLIED. A missing one, or one
         // whose recorded remote no longer matches, leaves `local_cfg` None and
         // must not claim a layer that did nothing.

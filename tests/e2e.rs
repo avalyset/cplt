@@ -1377,10 +1377,12 @@ mod e2e_tests {
     fn e2e_summary_table_reprints_when_a_cli_flag_changes_the_profile() {
         require_sandbox!();
         let (_, fake_dir) = cplt_cmd_with_fake_copilot();
+        let home = tempfile::tempdir().unwrap();
         let launch = |extra: &[&str]| {
             let (mut cmd, _keep) = cplt_cmd_with_fake_copilot();
             let out = cmd
                 .current_dir(fake_dir.path())
+                .env("HOME", home.path())
                 .args(["--yes", "--no-validate", "--no-proxy"])
                 .args(extra)
                 .args(["--", "--version"])

@@ -872,6 +872,8 @@ fun main() {
 
         let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
+            // These tests read detail-tier output: per-file audit lines, proxy start.
+            .arg("--verbose")
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             // Explicit so the test's intended fake "copilot" can't be silently
             // overridden by a `sandbox.agent` set in the real ~/.config/cplt
@@ -5265,7 +5267,7 @@ fi
             .current_dir(project.canonical_path())
             .env("HOME", home)
             .env("CPLT_CONFIG", &cfg)
-            .args(["--no-quiet", "exec", "--"])
+            .args(["--no-quiet", "--verbose", "exec", "--"])
             .arg(&run)
             .output()
             .expect("cplt should run");
