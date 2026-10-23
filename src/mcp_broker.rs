@@ -1730,11 +1730,6 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
         .unwrap_or(Value::Null);
     let mut args = Vec::new();
     let mut servers = Map::new();
-    let mut used: BTreeSet<String> = user
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
     for spec in specs {
         let mut matching: Vec<&String> = user
             .get("mcpServers")
@@ -1749,10 +1744,16 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
             .map(|(n, _)| n)
             .collect();
         matching.sort();
-        // Its own name: whether --additional-mcp-config wins over a
-        // same-named user entry is not documented, so never share one.
-        let name = free_name(spec, &mut used, false);
-        for other in &matching {
+        // Exactly the spec id: under a "Registry only" policy Copilot allows a
+        // server only when its config key is a registry server name. A user
+        // entry with the same name is overridden by --additional-mcp-config;
+        // every other entry running the command is turned off.
+        let name = spec.id.clone();
+        // Never one of the injected names: the flag would switch ours off.
+        for other in matching
+            .iter()
+            .filter(|n| !specs.iter().any(|s| &s.id == **n))
+        {
             args.push("--disable-mcp-server".into());
             args.push((*other).clone());
         }
@@ -2198,7 +2199,7 @@ mod tests {
         );
         let v: Value = serde_json::from_str(&args[5]).unwrap();
         assert_eq!(
-            v["mcpServers"]["io.github.nais__nais-mcp"]["args"],
+            v["mcpServers"]["io.github.nais/nais-mcp"]["args"],
             json!(["mcp-stdio", "io.github.nais/nais-mcp"])
         );
         assert!(copilot_args(None, &[], sock).is_empty());
@@ -2445,14 +2446,17 @@ mod tests {
                 .unwrap();
         let names: Vec<&String> = out["mcp"]["servers"].as_object().unwrap().keys().collect();
         assert_eq!(names, ["io.example.two__server", "server"], "{out}");
-        let cfg = r#"{"mcpServers":{"io.example.two__server":{"command":"x"}}}"#;
+        // Copilot: the key is exactly the id (registry policy), never
+        // renamed; a same-named user entry is overridden, not disabled.
+        let cfg = r#"{"mcpServers":{"io.example.two/server":{"command":"nais","args":["alpha","mcp","serve"]}}}"#;
         let args = copilot_args(Some(cfg), &[&one, &two], sock);
+        assert!(
+            !args.iter().any(|a| a == "--disable-mcp-server"),
+            "{args:?}"
+        );
         let v: Value = serde_json::from_str(args.last().unwrap()).unwrap();
         let names: Vec<&String> = v["mcpServers"].as_object().unwrap().keys().collect();
-        assert_eq!(
-            names,
-            ["io.example.one__server", "io.example.two__server-2"]
-        );
+        assert_eq!(names, ["io.example.one/server", "io.example.two/server"]);
     }
 
     #[cfg(target_os = "macos")]

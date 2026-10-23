@@ -2557,7 +2557,7 @@ print("AGENT:" + s.recv(64).decode().split("\r\n")[0])
             .collect();
         assert_eq!(resp.len(), 5, "stdout: {stdout}\nstderr: {stderr}");
         assert!(
-            stdout.contains("ENTRY:io.example__fake-mcp:cplt mcp-stdio io.example/fake-mcp"),
+            stdout.contains("ENTRY:io.example/fake-mcp:cplt mcp-stdio io.example/fake-mcp"),
             "{stdout}"
         );
         assert_eq!(resp[0]["result"]["serverInfo"]["name"], "fake");

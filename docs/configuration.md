@@ -1119,9 +1119,13 @@ on the host, outside the sandbox, and points your client's entry at
 - Only the tools in the spec's `tools.allow` are listed or callable. For
   `execute_graphql`, cplt refuses mutations, subscriptions and documents with
   more than one operation.
-- Copilot CLI gets `--additional-mcp-config` with an entry named after the
-  id (`io.github.nais__nais-mcp`), and `--disable-mcp-server` for your own
-  entries that run the same command. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
+- Copilot CLI gets `--additional-mcp-config` with an entry named exactly the
+  server id (`io.github.nais/nais-mcp`), so a "Registry only" MCP policy
+  still allows it, and `--disable-mcp-server` for your own entries that run
+  the same command under another name. An entry of yours with exactly the id
+  as its name is not disabled (that would turn off cplt's too); cplt relies on
+  `--additional-mcp-config` taking precedence over it, which Copilot does not
+  document. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
   Your config files are not changed.
 - A spec cplt refuses prints one line at launch, and the entry stays as
   configured. `cplt mcp status --json`, run in the project, lists the specs, their
