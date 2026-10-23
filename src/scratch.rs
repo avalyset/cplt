@@ -732,8 +732,10 @@ fn gc_stale_session_dirs(base: &Path) {
             if metadata.uid() != unsafe { libc::getuid() } {
                 continue;
             }
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-            if let Err(e) = std::fs::remove_dir_all(&path) {
+            if let Ok(dir) = open_dir_nofollow(&path) {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            if let Err(e) = remove_tree(&path) {
                 ui::warn(&format!(
                     "Warning: cannot remove stale scratch dir {}: {e}",
                     path.display()
@@ -1055,11 +1057,83 @@ fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, labe
         return;
     }
     drop(dir_file);
-    if let Err(error) = std::fs::remove_dir_all(path) {
+    if let Err(error) = remove_tree(path) {
         ui::warn(&format!(
             "Warning: cannot cleanup {label} {}: {error}",
             path.display()
         ));
+    }
+}
+
+/// `remove_dir_all`, retrying once after giving the owner rwx on every real
+/// directory below `dir`. Tools run in the sandbox (Go's module cache, for
+/// one) leave read-only dirs behind. The walk only runs on EACCES, so a
+/// large `node_modules` costs no extra chmods in the common case.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_subdirs_removable(dir);
+            std::fs::remove_dir_all(dir)
+        }
+        other => other,
+    }
+}
+
+/// Never follows symlinks at any depth: the walk is fd-relative. Each child
+/// is opened with `openat(parent, name, O_DIRECTORY|O_NOFOLLOW)`, listed
+/// through `fdopendir` and chmodded with `fchmod`, so swapping any dir in the
+/// tree for a symlink cannot steer the walk outside the scratch dir.
+fn make_subdirs_removable(dir: &Path) {
+    if let Ok(top) = open_dir_nofollow(dir) {
+        chmod_subdirs_at(&top);
+    }
+}
+
+fn chmod_subdirs_at(dir: &std::fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // fdopendir takes ownership of the fd it gets, so hand it a dup.
+    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup < 0 {
+        return;
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        unsafe { libc::close(dup) };
+        return;
+    }
+    let mut names = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+
+    for name in names {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            continue; // not a dir, a symlink, or unreadable
+        }
+        // SAFETY: `fd` is a fresh descriptor this File now owns.
+        let child = unsafe { std::fs::File::from_raw_fd(fd) };
+        if let Ok(meta) = child.metadata() {
+            let mode = meta.permissions().mode() | 0o700;
+            let _ = child.set_permissions(std::fs::Permissions::from_mode(mode));
+            chmod_subdirs_at(&child);
+        }
     }
 }
 
@@ -1570,6 +1644,42 @@ mod tests {
         assert!(fresh_dir.exists(), "fresh dir should be preserved");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gc_removes_stale_dir_with_read_only_subdirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(SCRATCH_BASE);
+        let stale_dir = base.join("0123456789abcdef0123456789abcdef");
+        let ro = stale_dir.join("go/pkg/mod/x@v1");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::write(ro.join("f.go"), "package x").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(&outside, ro.join("link")).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(ro.parent().unwrap(), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+        std::fs::File::open(&stale_dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        ScratchDir::gc_stale(tmp.path());
+
+        assert!(
+            !stale_dir.exists(),
+            "stale dir with read-only subdirs should be removed"
+        );
+        let mode = outside.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o555,
+            "symlink target outside scratch must not be chmodded"
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
