@@ -2331,7 +2331,10 @@ mod tests {
     fn file_level_write_grants_and_policy_rejections() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join(FILE);
-        std::fs::write(&f, spec_json(with(base(), "/credential", json!("none")))).unwrap();
+        // `sh`, not `nais`: load resolves the command in the real trusted
+        // dirs, and CI has no nais.
+        let none = with(base(), "/credential", json!("none"));
+        std::fs::write(&f, spec_json(with(none, "/command", json!(["sh"])))).unwrap();
         let found = load(dir.path(), std::slice::from_ref(&f), &[]);
         assert!(found.specs.is_empty() && found.rejected[0].reason.contains("can write"));
         let mut found = load(dir.path(), &[], &[]);
@@ -2435,10 +2438,15 @@ mod tests {
     fn no_child_after_stop() {
         let b = cat_broker();
         b.shared.stop.store(true, Ordering::Release);
-        let (_a, mut ra) = connect(&b);
-        let mut l = String::new();
-        let n = ra.read_line(&mut l).unwrap_or(0);
-        assert_eq!(n, 0, "closed without serving: {l}");
+        // The accept loop may already be gone (connect or write then fails)
+        // or may still accept: either way no child may start.
+        if let Ok(mut s) = UnixStream::connect(b.socket()) {
+            let _ = writeln!(s, "io.github.nais/nais-mcp");
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut l = String::new();
+            let _ = BufReader::new(s).read_line(&mut l);
+            assert!(l.is_empty(), "closed without serving: {l}");
+        }
         assert!(
             b.shared.servers["io.github.nais/nais-mcp"]
                 .child
@@ -2446,5 +2454,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// nav-pilot's own OPENCODE_CONFIG_CONTENT (policy, plugins, providers,
+    /// agent model, its other servers) survives; only the broker's entry is
+    /// added, and an entry under the short name that does not run the spec's
+    /// command (here disabled) is left alone, so the broker takes another name.
+    #[test]
+    fn opencode_overlay_keeps_existing_content() {
+        let s = check(base()).unwrap();
+        let existing = json!({
+            "permission": {"bash": "ask"},
+            "plugin": ["nav-pilot-hooks"],
+            "enabled_providers": ["github-copilot"],
+            "agent": {"build": {"model": "github-copilot/x"}},
+            "mcp": {"servers": {
+                "aksel": {"type": "remote", "url": "https://aksel.example"},
+                "nais-mcp": {"type": "local", "command": ["other"], "enabled": false}
+            }}
+        });
+        let out = opencode_overlay(
+            Some(&existing.to_string()),
+            std::slice::from_ref(&existing),
+            &[&s],
+            Path::new("/s"),
+        )
+        .unwrap();
+        let mut out: Value = serde_json::from_str(&out).unwrap();
+        let added = out["mcp"]["servers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.github.nais__nais-mcp")
+            .unwrap();
+        assert_eq!(
+            added["command"],
+            json!(["cplt", "mcp-stdio", "io.github.nais/nais-mcp"])
+        );
+        assert_eq!(out, existing, "everything else unchanged");
     }
 }
