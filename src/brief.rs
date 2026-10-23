@@ -931,6 +931,7 @@ mod tests {
             with_proxy: true,
             proxy_forced: false,
             github_mcp_proxy: true,
+            mcp_broker: true,
             proxy_port: 0,
             blocked_domains: None,
             allowed_domains: None,

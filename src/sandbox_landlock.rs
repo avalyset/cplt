@@ -3093,6 +3093,7 @@ mod tests {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

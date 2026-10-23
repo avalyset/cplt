@@ -2395,6 +2395,125 @@ mod e2e_tests {
         out
     }
 
+    /// MCP host broker (#824), end to end through cplt: a broker spec for a
+    /// fake stdio server, a fake Copilot that drives `cplt mcp-stdio` from
+    /// inside the sandbox with the entry cplt added to its args. The server
+    /// offers two tools; only the allowed one is listed, and calling the other
+    /// is refused by the broker before it reaches the server.
+    #[test]
+    fn e2e_mcp_broker_filters_tools_and_refuses_calls() {
+        require_sandbox!();
+        let home = home_temp_dir("mcp-broker");
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let server = home_path.join("fake_mcp.py");
+        std::fs::write(
+            &server,
+            r#"import sys, json
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m:
+        continue
+    meth = m["method"]
+    if meth == "initialize":
+        r = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
+    elif meth == "tools/list":
+        r = {"tools": [{"name": "echo", "inputSchema": {}}, {"name": "delete_everything", "inputSchema": {}}]}
+    elif meth == "tools/call":
+        r = {"content": [{"type": "text", "text": "SERVER-RAN:" + m["params"]["name"]}]}
+    else:
+        r = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
+"#,
+        )
+        .unwrap();
+        let spec_dir = home_path.join(".config/cplt/mcp");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let spec = serde_json::json!({
+            "name": "io.example/fake-mcp",
+            "version": "1.0.0",
+            "_meta": {"io.github.navikt/broker": {
+                "v": 1,
+                "credential": "none",
+                "command": ["python3", server.display().to_string()],
+                "tools": {"allow": ["echo"]}
+            }}
+        });
+        std::fs::write(spec_dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
+
+        let fake = fake_agent_dir("copilot");
+        let agent = fake.path().join("copilot");
+        std::fs::write(
+            &agent,
+            format!(
+                r#"#!/usr/bin/python3
+import sys, json, os, subprocess
+a = sys.argv
+cfg = json.loads(a[a.index("--additional-mcp-config") + 1])
+name, e = next(iter(cfg["mcpServers"].items()))
+print("ENTRY:" + name + ":" + e["command"] + " " + " ".join(e["args"]))
+env = dict(os.environ, **e["env"])
+p = subprocess.Popen(["{cplt}"] + e["args"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True)
+msgs = [
+    {{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {{"protocolVersion": "2025-11-25", "capabilities": {{}}, "clientInfo": {{"name": "t", "version": "1"}}}}}},
+    {{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}},
+    {{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {{"name": "delete_everything", "arguments": {{}}}}}},
+    {{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {{"name": "echo", "arguments": {{}}}}}},
+]
+for m in msgs:
+    p.stdin.write(json.dumps(m) + "\n")
+    p.stdin.flush()
+    print("RESP:" + p.stdout.readline().strip(), flush=True)
+p.stdin.close()
+p.wait()
+"#,
+                cplt = binary_path().display()
+            ),
+        )
+        .unwrap();
+        let out = cplt_cmd()
+            .args(["--yes", "--no-validate", "--agent", "copilot"])
+            .env("HOME", &home_path)
+            .env_remove("XDG_CONFIG_HOME")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake.path().display()),
+            )
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let resp: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("RESP:"))
+            .map(|l| serde_json::from_str(l).expect("a JSON-RPC line"))
+            .collect();
+        assert_eq!(resp.len(), 4, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("ENTRY:fake-mcp:cplt mcp-stdio io.example/fake-mcp"),
+            "{stdout}"
+        );
+        assert_eq!(resp[0]["result"]["serverInfo"]["name"], "fake");
+        let tools: Vec<&str> = resp[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, ["echo"], "{stdout}");
+        assert_eq!(resp[2]["error"]["code"], -32001, "{stdout}");
+        assert!(resp[2].get("result").is_none(), "{stdout}");
+        assert_eq!(
+            resp[3]["result"]["content"][0]["text"], "SERVER-RAN:echo",
+            "{stdout}"
+        );
+        assert!(!stdout.contains("SERVER-RAN:delete_everything"), "{stdout}");
+        assert!(
+            stderr.contains("DENIED"),
+            "the refusal is mirrored: {stderr}"
+        );
+    }
+
     /// The whole chain: shim → cplt → sandbox → the real agent, with the shim
     /// directory first on PATH. cplt must skip its own shim when it resolves
     /// the agent (without the skip it launches the shim inside the sandbox,

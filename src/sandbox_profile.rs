@@ -208,7 +208,16 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_gpg_signing_rules(&mut sb, &home, config.allow_gpg_signing, config.extra_deny);
     emit_docker_rules(&mut sb, &home, config.allow_docker, config.extra_deny);
     emit_socket_rules(&mut sb, config.extra_socket, config.extra_deny);
-    emit_worktree_broker(&mut sb, config.worktree_socket);
+    emit_broker_socket(
+        &mut sb,
+        config.worktree_socket,
+        "Managed worktree broker socket (cplt worktree add, #531)",
+    );
+    emit_broker_socket(
+        &mut sb,
+        config.mcp_socket,
+        "MCP broker socket (cplt mcp-stdio, #824)",
+    );
     emit_network_rules(
         &mut sb,
         &home,
@@ -3398,14 +3407,11 @@ const DOCKER_SOCKET_PATHS: &[&str] = &[
 /// short private directory whose name and contents the sandbox cannot write,
 /// so the session cannot be pointed at another session's socket. Outbound
 /// only: the broker listens in the parent, the sandbox never binds.
-fn emit_worktree_broker(sb: &mut String, socket: Option<&Path>) {
+fn emit_broker_socket(sb: &mut String, socket: Option<&Path>, label: &str) {
     let Some(socket) = socket else {
         return;
     };
-    sbpl!(
-        sb,
-        ";; Managed worktree broker socket (cplt worktree add, #531)"
-    );
+    sbpl!(sb, ";; {label}");
     sbpl!(
         sb,
         "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
@@ -4630,6 +4636,7 @@ mod tests {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

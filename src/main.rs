@@ -587,6 +587,11 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_github_mcp_proxy: bool,
 
+    /// Leave this brokered MCP server (spec id) as configured for this run.
+    /// Repeatable. `sandbox.mcp_broker = false` turns the broker off.
+    #[arg(long, value_name = "ID")]
+    no_mcp_broker: Vec<String>,
+
     /// EXPERIMENTAL. With --brief, also write the managed cplt block into the
     /// project's AGENTS.md. Off by default, unstable, and may be removed in a
     /// future release. Has no effect without --brief (or `sandbox.brief`).
@@ -918,6 +923,17 @@ NOTE:
         action: WorktreeAction,
     },
 
+    /// Brokered MCP servers (#824): `cplt mcp status [--json]`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+
+    /// Inside a session: pipe stdio to the brokered MCP server `<id>`. Client
+    /// configs get this as the server's command; it is not run by hand.
+    #[command(name = "mcp-stdio", hide = true)]
+    McpStdio { id: String },
+
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -1237,6 +1253,16 @@ EXAMPLES:
     Explain {
         /// Config key to explain (omit to list all)
         key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// The broker specs cplt reads, and why any were rejected.
+    Status {
+        /// Machine-readable output (versioned schema).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4455,6 +4481,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(cplt::worktree_broker::run_client(&name, &reference));
         }
     }
+    match cli.command.take() {
+        Some(Command::McpStdio { id }) => return Ok(cplt::mcp_broker::run_stdio(&id)),
+        Some(Command::Mcp {
+            action: McpAction::Status { json },
+        }) => return Ok(cplt::mcp_broker::run_status(json)),
+        other => cli.command = other,
+    }
 
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Exec { .. })) {
@@ -4609,6 +4642,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Worktree { .. } => {
                 unreachable!("Command::Worktree handled before this match")
             }
+            Command::Mcp { .. } | Command::McpStdio { .. } => {
+                unreachable!("Command::Mcp handled before this match")
+            }
         });
     }
 
@@ -4688,6 +4724,21 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // dyld access to load Electron Framework from within the .app bundle.
     let electron_app_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
 
+    // Brokered MCP servers (#824). Before the proxy starts: their egress hosts
+    // join this session's allowlist. No spec files, no change.
+    let mcp_found = if resolved.mcp_broker && !cli.print_profile {
+        let writable = sandbox::session_writable_roots(
+            &project_dir,
+            &policy_roots,
+            &resolved.allow_write,
+            Some(&scratch::ScratchDir::base(&home_dir)),
+        );
+        cplt::mcp_broker::detect(&home_dir, &writable, &cli.no_mcp_broker)
+    } else {
+        cplt::mcp_broker::Detected::default()
+    };
+    resolved.allow_domains.extend(mcp_found.egress_hosts());
+
     let AssembledSandbox {
         mut prepared,
         policy,
@@ -4697,6 +4748,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
+        mcp_broker,
         ..
     } = assemble_sandbox(
         &cli,
@@ -4716,6 +4768,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             pnpm_candidate: None,
             inspect_only: cli.print_profile,
             opencode_v2,
+            mcp_specs: &mcp_found.specs,
         },
     )?;
 
@@ -4762,6 +4815,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
         // These variables carry the session's isolation; dropping them would
         // point OpenCode back at the host service.
+        if let Some(broker) = &mcp_broker {
+            let host_reaches = resolved.inherit_env
+                || resolved
+                    .pass_env
+                    .iter()
+                    .any(|p| p == "OPENCODE_CONFIG_CONTENT");
+            cplt::mcp_broker::opencode(
+                &mut session.env,
+                &home_dir,
+                broker,
+                &resolved.deny_env,
+                host_reaches,
+            );
+        }
         if let Some((name, _)) = session
             .env
             .iter()
@@ -4941,7 +5008,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     };
 
     // Build agent args: extra args (e.g. --no-auto-update) + forwarded convenience flags + explicit -- args
-    let copilot_args = build_copilot_args(&cli, &active_agent, &repo_paths);
+    let mut copilot_args = build_copilot_args(&cli, &active_agent, &repo_paths);
+    if let Some(broker) = mcp_broker
+        .as_ref()
+        .filter(|_| active_agent == agent::Agent::Copilot)
+    {
+        copilot_args.extend(cplt::mcp_broker::copilot(&home_dir, broker));
+    }
 
     // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
     // The audit is on by default and suppressed by --no-audit or --quiet. The
@@ -6118,6 +6191,8 @@ struct AssemblyOptions<'a> {
     inspect_only: bool,
     /// An OpenCode v2 session: the host state dir is not granted (#796).
     opencode_v2: bool,
+    /// Brokered MCP servers to serve (#824); empty off the launch path.
+    mcp_specs: &'a [cplt::mcp_broker::Spec],
 }
 
 /// A fully-built sandbox plus the live resources it depends on.
@@ -6139,6 +6214,8 @@ struct AssembledSandbox {
     /// Serves `cplt worktree add` for as long as the agent runs. Dropping it
     /// stops the worker and removes the socket.
     worktree_broker: Option<cplt::worktree_broker::Broker>,
+    /// Serves `cplt mcp-stdio` (#824). Dropping it stops every child.
+    mcp_broker: Option<cplt::mcp_broker::Broker>,
 }
 
 /// Start the managed-worktree broker for a launch (#531), or `None` when the
@@ -6455,6 +6532,25 @@ fn assemble_sandbox(
         },
         _ => None,
     };
+    let mcp_broker = match (opts.mcp_specs, proxy_port_for_profile) {
+        ([], _) => None,
+        (_, None) => {
+            ui::warn(
+                "brokered MCP servers go through cplt's proxy, which is off: left as configured.",
+            );
+            None
+        }
+        (specs, Some(port)) => {
+            let log = cplt::mcp_broker::Log {
+                file: resolved.proxy_log_file.clone(),
+            };
+            cplt::mcp_broker::Broker::start(specs.to_vec(), port, home_dir, log)
+                .inspect_err(|e| {
+                    ui::warn(&format!("MCP broker unavailable: {e}. Left as configured."));
+                })
+                .ok()
+        }
+    };
     let mut sandbox_config = build_sandbox_config(
         resolved,
         probe,
@@ -6490,6 +6586,7 @@ fn assemble_sandbox(
     sandbox_config.worktree_socket = worktree_broker
         .as_ref()
         .map(cplt::worktree_broker::Broker::socket);
+    sandbox_config.mcp_socket = mcp_broker.as_ref().map(cplt::mcp_broker::Broker::socket);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
     let mut prepared =
@@ -6512,6 +6609,7 @@ fn assemble_sandbox(
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
         worktree_broker,
+        mcp_broker,
     })
 }
 
@@ -6593,6 +6691,7 @@ fn build_sandbox_config<'a>(
         named_root_git_dirs: repos.git_dirs,
         managed_worktree_root: repos.worktree_root,
         worktree_socket: None,
+        mcp_socket: None,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -6660,6 +6759,7 @@ fn prepare_shell_sandbox(
             // `cplt check` only reports on the policy.
             inspect_only: true,
             opencode_v2: false,
+            mcp_specs: &[],
         },
     )
 }
@@ -6809,6 +6909,7 @@ fn run_exec_command(
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         worktree_broker,
+        mcp_broker: _,
     } = {
         let mut probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
         // `exec` never writes the managed block, so it gets no read on a root
@@ -6832,6 +6933,7 @@ fn run_exec_command(
                 pnpm_candidate,
                 inspect_only: cli.print_profile,
                 opencode_v2: false,
+                mcp_specs: &[],
             },
         )?
     };
@@ -12629,6 +12731,7 @@ mod tests {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             home_dir: &home,
             extra_read: &base_extra_read,
             extra_write: &[],

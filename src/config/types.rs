@@ -654,6 +654,9 @@ pub struct SandboxConfig {
     /// Route OpenCode's GitHub MCP entry through cplt's read-only proxy
     /// (default: true, #797).
     pub github_mcp_proxy: Option<bool>,
+    /// Broker the local MCP servers that have a spec in
+    /// `~/.config/cplt/mcp/` (default: true, #824).
+    pub mcp_broker: Option<bool>,
     /// Also inject the managed sandbox block into the project's `AGENTS.md`
     /// (default: false — opt-in, since it writes into the user's repo).
     /// Requires `brief`: with the brief off, this never fires.
@@ -1005,6 +1008,7 @@ pub struct Resolved {
     pub no_validate: bool,
     pub brief: bool,
     pub github_mcp_proxy: bool,
+    pub mcp_broker: bool,
     pub agents_md: bool,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,

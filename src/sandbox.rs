@@ -190,6 +190,9 @@ pub struct SandboxConfig<'a> {
     /// one exact path. `Some` only with the managed root on, and only from
     /// `assemble_sandbox` after the broker has bound it.
     pub worktree_socket: Option<&'a Path>,
+    /// The MCP broker socket for `cplt mcp-stdio` (#824), granted outbound as
+    /// one exact path, like `worktree_socket`. macOS only.
+    pub mcp_socket: Option<&'a Path>,
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
@@ -3493,6 +3496,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     if let Some(socket) = config.worktree_socket {
         policy::validate_sbpl_path(socket).map_err(|e| format!("Worktree broker socket: {e}"))?;
     }
+    if let Some(socket) = config.mcp_socket {
+        policy::validate_sbpl_path(socket).map_err(|e| format!("MCP broker socket: {e}"))?;
+    }
     if let Some(dir) = config.copilot_install_dir {
         policy::validate_sbpl_path(dir).map_err(|e| format!("Copilot install dir: {e}"))?;
     }
@@ -3748,6 +3754,7 @@ mod tests {
             named_root_git_dirs: &[],
             managed_worktree_root: None,
             worktree_socket: None,
+            mcp_socket: None,
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
             extra_ports: &[],

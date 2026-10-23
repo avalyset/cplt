@@ -247,6 +247,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "mcp_broker",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Run the local MCP servers that have a broker spec in ~/.config/cplt/mcp/ (written by nav-pilot) on the host, behind cplt's tool policy, instead of inside the sandbox. macOS only. Turn one off for a run with --no-mcp-broker <id>.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "brief",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -980,6 +988,13 @@ bool_keys! {
         config = |c: &Config| c.sandbox.github_mcp_proxy,
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.github_mcp_proxy;
+
+    /// Config-only; `--no-mcp-broker <id>` turns off one server per run.
+    mcp_broker, "sandbox", "mcp_broker",
+        cli = |_: &CliFlags| FeatureToggle::UseDefault,
+        config = |c: &Config| c.sandbox.mcp_broker,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.mcp_broker;
 
     brief, "sandbox", "brief",
         cli = |c: &CliFlags| c.brief,
