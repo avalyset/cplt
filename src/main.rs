@@ -4736,6 +4736,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     let mut v2_model = None;
+    let mut v2_tui = Vec::new();
     if opencode_v2 {
         let Some(scratch) = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path) else {
             bail!(
@@ -4746,6 +4747,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         let mut session = cplt::opencode_v2::prepare(scratch, &home_dir, &launch_dir)
             .map_err(|e| anyhow::anyhow!("Cannot set up the OpenCode v2 session: {e}"))?;
         v2_model = std::mem::replace(&mut session.model, Err(())).ok();
+        v2_tui = std::mem::take(&mut session.tui);
         if resolved.github_mcp_proxy {
             let reaches = |v: &str| {
                 !resolved.deny_env.iter().any(|d| d == v)
@@ -5005,6 +5007,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
     }
+    cplt::opencode_v2::save_tui(&v2_tui, &home_dir);
     if let Some(stores) = opencode_stores {
         stores.report(settled);
     }

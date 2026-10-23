@@ -24,7 +24,9 @@
 //! host. So are the TUI's favourite models and prompt history (#793): the
 //! host `model.json` is copied in and, when the session changed it, back out
 //! at exit; `prompt-history.jsonl` is a link to the host file, which the
-//! one host state file the session is granted (#796). Overlay entries are a snapshot: a top-level entry the user creates
+//! one host state file the session is granted (#796). The TUI's
+//! `latest/tui/highlights.json` (the "What's new" version last seen) and
+//! `tabs.json` are carried like `model.json`. Overlay entries are a snapshot: a top-level entry the user creates
 //! during the session is not seen until the next one.
 
 use std::io::Write;
@@ -42,6 +44,9 @@ pub struct Session {
     /// at exit. `Err`: the host file was refused or not copied, so it is left
     /// alone.
     pub model: Result<(std::fs::File, Option<String>), ()>,
+    /// The TUI files under `latest/tui` carried like `model.json`, for
+    /// [`save_tui`] at exit. Refused or uncopied files are left out.
+    pub tui: Vec<Carried>,
     /// Appended to the end of the macOS profile (last match wins).
     #[cfg(target_os = "macos")]
     pub sbpl: String,
@@ -63,6 +68,22 @@ pub struct Session {
     #[cfg(not(target_os = "macos"))]
     pub writes: Vec<PathBuf>,
 }
+
+/// A state file copied into the session, to copy back at exit if it changed.
+pub struct Carried {
+    /// The session's dir holding it, opened before the agent runs.
+    dir: std::fs::File,
+    name: &'static str,
+    /// The host file as copied in; `None`: there was none.
+    before: Option<String>,
+}
+
+/// The TUI state dir under `$XDG_STATE_HOME/opencode`, for the `latest`
+/// release channel.
+const TUI_DIR: &str = "latest/tui";
+/// TUI files carried across sessions: the last "What's new" version seen,
+/// and the open tabs per directory.
+const TUI_FILES: [&str; 2] = ["highlights.json", "tabs.json"];
 
 /// An XDG base from the environment, ignoring a relative or empty value as the
 /// spec says, else `$HOME/<default>`.
@@ -96,6 +117,10 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     // Opened now, before the agent can swap the dir for a link (#793).
     let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"))
         .and_then(|m| Ok((open_dir(&state.join("opencode")).map_err(|_| ())?, m)));
+    let tui = carry_in_tui(
+        &state_base.join("opencode").join(TUI_DIR),
+        &state.join("opencode").join(TUI_DIR),
+    );
     let explicit = global_config_file(&user_oc);
     build_overlay(&config_base, &user_oc, &config, explicit.is_some())
         .map_err(|e| format!("{}: {e}", config.display()))?;
@@ -167,6 +192,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
         env,
         port,
         model,
+        tui,
         #[cfg(target_os = "macos")]
         sbpl,
         #[cfg(target_os = "macos")]
@@ -212,15 +238,55 @@ fn carry_in_state(host: &Path, own: &Path) -> Result<Option<String>, ()> {
     {
         crate::ui::warn(&format!("OpenCode v2: prompt history not shared: {e}"));
     }
-    let text = match crate::untrusted::read_untrusted(&host.join("model.json"), MODEL_LIMIT) {
+    carry_in_file(host, own, "model.json", MODEL_LIMIT)
+}
+
+/// Copy `host/name` into `own`. `Err`: refused or not copied, so the host
+/// file must be left alone at exit.
+fn carry_in_file(host: &Path, own: &Path, name: &str, limit: u64) -> Result<Option<String>, ()> {
+    let text = match crate::untrusted::read_untrusted(&host.join(name), limit) {
         Ok(Some(t)) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         // A link (a dotfile manager's), FIFO or oversized file: never copied
         // back over.
         _ => return Err(()),
     };
-    std::fs::write(own.join("model.json"), &text).map_err(|_| ())?;
+    std::fs::write(own.join(name), &text).map_err(|_| ())?;
     Ok(Some(text))
+}
+
+/// Cap on each TUI state file read back from the session.
+const TUI_LIMIT: u64 = 1 << 20;
+
+/// Copy the host TUI files into the session's `latest/tui`. Best effort: a
+/// failure brings back the "What's new" dialog or loses tabs, not the session.
+fn carry_in_tui(host: &Path, own: &Path) -> Vec<Carried> {
+    if std::fs::create_dir_all(own).is_err() {
+        return Vec::new();
+    }
+    TUI_FILES
+        .iter()
+        .filter_map(|&name| {
+            let before = carry_in_file(host, own, name, TUI_LIMIT).ok()?;
+            Some(Carried {
+                dir: open_dir(own).ok()?,
+                name,
+                before,
+            })
+        })
+        .collect()
+}
+
+/// Copy the session's TUI files back to the host, like [`save_model`].
+pub fn save_tui(carried: &[Carried], home: &Path) {
+    let host = xdg_base("XDG_STATE_HOME", home, ".local/state")
+        .join("opencode")
+        .join(TUI_DIR);
+    for c in carried {
+        if let Err(e) = save_file_to(&c.dir, &host, c.name, TUI_LIMIT, c.before.as_deref()) {
+            crate::ui::warn(&format!("OpenCode v2: {} not saved: {e}", c.name));
+        }
+    }
 }
 
 /// Copy the session's `model.json` back to the host if it changed since
@@ -242,9 +308,26 @@ fn open_dir(dir: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Result<(), String> {
-    let text = match crate::untrusted::read_untrusted_at(own, "model.json", MODEL_LIMIT) {
+    save_file_to(own, host, "model.json", MODEL_LIMIT, before)
+}
+
+/// Copy `name` from the session dir `own` to `host` if it changed and is
+/// JSON, via an `O_EXCL` temp file and a rename.
+fn save_file_to(
+    own: &std::fs::File,
+    host: &Path,
+    name: &str,
+    limit: u64,
+    before: Option<&str>,
+) -> Result<(), String> {
+    let text = match crate::untrusted::read_untrusted_at(own, name, limit) {
         Ok(Some(t)) => t,
-        Ok(None) => return Err("model.json is not a regular file of at most 1 MiB".into()),
+        Ok(None) => {
+            return Err(format!(
+                "{name} is not a regular file of at most {} KiB",
+                limit >> 10
+            ));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.to_string()),
     };
@@ -252,15 +335,16 @@ fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Resu
         return Ok(());
     }
     serde_json::from_str::<serde_json::Value>(&text)
-        .map_err(|e| format!("model.json is not JSON: {e}"))?;
-    let tmp = host.join(format!(".model.json.cplt-{}", std::process::id()));
+        .map_err(|e| format!("{name} is not JSON: {e}"))?;
+    std::fs::create_dir_all(host).map_err(|e| e.to_string())?;
+    let tmp = host.join(format!(".{name}.cplt-{}", std::process::id()));
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .and_then(|mut f| f.write_all(text.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, host.join("model.json")))
+        .and_then(|()| std::fs::rename(&tmp, host.join(name)))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
@@ -1280,6 +1364,72 @@ mod tests {
         std::os::unix::fs::symlink(&target, host.join("model.json")).unwrap();
         std::fs::remove_file(own.join("prompt-history.jsonl")).unwrap();
         assert_eq!(carry_in_state(&host, &own), Err(()));
+    }
+
+    /// The "What's new" marker and tabs come in, go back out only when
+    /// changed, and a refused host file is neither carried nor overwritten.
+    #[test]
+    fn state_carries_tui_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host, own) = (tmp.path().join("host/tui"), tmp.path().join("own/tui"));
+        assert!(carry_in_tui(&host, &own).iter().all(|c| c.before.is_none()));
+
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("highlights.json"), r#"{"seen":"2.1.3"}"#).unwrap();
+        let target = tmp.path().join("dotfile.json");
+        std::fs::write(&target, r#"{"tabs":1}"#).unwrap();
+        std::os::unix::fs::symlink(&target, host.join("tabs.json")).unwrap();
+        let carried = carry_in_tui(&host, &own);
+        assert_eq!(carried.len(), 1, "the linked tabs.json is refused");
+        assert_eq!(carried[0].name, "highlights.json");
+        assert_eq!(
+            std::fs::read_to_string(own.join("highlights.json")).unwrap(),
+            r#"{"seen":"2.1.3"}"#
+        );
+        assert!(!own.join("tabs.json").exists());
+
+        // Unchanged: left alone.
+        std::fs::write(host.join("highlights.json"), r#"{"seen":"9"}"#).unwrap();
+        let save = |c: &Carried, host: &Path| {
+            save_file_to(&c.dir, host, c.name, TUI_LIMIT, c.before.as_deref()).unwrap();
+        };
+        for c in &carried {
+            save(c, &host);
+        }
+        assert_eq!(
+            std::fs::read_to_string(host.join("highlights.json")).unwrap(),
+            r#"{"seen":"9"}"#
+        );
+
+        std::fs::write(own.join("tabs.json"), r#"{"agent":1}"#).unwrap();
+        std::fs::write(own.join("highlights.json"), r#"{"seen":"2.2.0"}"#).unwrap();
+        for c in &carried {
+            save(c, &host);
+        }
+        assert_eq!(
+            std::fs::read_to_string(host.join("highlights.json")).unwrap(),
+            r#"{"seen":"2.2.0"}"#
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"tabs":1}"#);
+        assert!(
+            std::fs::symlink_metadata(host.join("tabs.json"))
+                .unwrap()
+                .is_symlink()
+        );
+
+        // A host dir missing at start is created at exit.
+        let fresh = tmp.path().join("fresh/tui");
+        let own2 = tmp.path().join("own2/tui");
+        let carried = carry_in_tui(&fresh, &own2);
+        std::fs::write(own2.join("tabs.json"), "{}").unwrap();
+        for c in &carried {
+            save(c, &fresh);
+        }
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("tabs.json")).unwrap(),
+            "{}"
+        );
+        assert!(!fresh.join("highlights.json").exists());
     }
 
     /// The copy-back reads through the dir opened at prepare: a link swapped
