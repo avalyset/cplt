@@ -116,8 +116,10 @@ pub(crate) struct Tools {
 pub(crate) struct Login {
     #[serde(default)]
     run: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
+    /// Accepted so a spec carrying it still loads (nav-pilot writes it), but
+    /// never used: cplt's probe comes from its mechanism table.
+    #[serde(default, rename = "status")]
+    _status: Option<String>,
 }
 
 /// `$XDG_CONFIG_HOME/cplt/mcp`, the directory nav-pilot writes specs to.
@@ -168,15 +170,23 @@ pub fn validate(
         ));
     }
     let ext: Ext = serde_json::from_value(ext.clone()).map_err(|e| format!("extension: {e}"))?;
-    let remotes = root.get("remotes").cloned().unwrap_or(Value::Null);
+    // 4: only a host command is brokered; any remote upstream is refused, so
+    // nothing in `remotes[]` is read further.
+    if root
+        .get("remotes")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        return Err("remote upstreams are not brokered yet; only a host command".into());
+    }
+    // `packages[]` is never run (`command` is), but it is part of the spec
+    // nav-pilot hands over, so invariants 2 and 6 still hold for it.
     let packages = root.get("packages").cloned().unwrap_or(Value::Null);
 
     // 2 and 6: no secret values and no credential placeholders. Credentials
     // come from cplt's mechanism table only, never from the spec.
     let mut strings = Vec::new();
-    for v in [&remotes, &packages] {
-        collect_strings(v, &mut strings);
-    }
+    collect_strings(&packages, &mut strings);
     strings.extend(ext.command.iter().map(String::as_str));
     strings.extend(ext.egress_hosts.iter().map(String::as_str));
     for s in &strings {
@@ -203,16 +213,6 @@ pub fn validate(
 
     // 1: the mechanism exists and fixes what may run.
     let credential = Credential::parse(&ext.credential)?;
-    // 4: https upstreams only; phase 1 brokers host commands only.
-    for r in remotes.as_array().into_iter().flatten() {
-        let url = r.get("url").and_then(Value::as_str).unwrap_or_default();
-        if !url.starts_with("https://") {
-            return Err("remote upstreams must be https".into());
-        }
-    }
-    if remotes.as_array().is_some_and(|a| !a.is_empty()) {
-        return Err("remote upstreams are not brokered yet; only a host command".into());
-    }
     if ext.command.is_empty() {
         return Err("no command".into());
     }
@@ -270,10 +270,7 @@ pub fn validate(
         }
         graphql.insert(tool.clone());
     }
-    let login = ext.login.and_then(|l| {
-        let _ = l.status;
-        l.run
-    });
+    let login = ext.login.and_then(|l| l.run);
     if login
         .as_deref()
         .is_some_and(|l| l.chars().any(char::is_control))
@@ -562,13 +559,13 @@ mod tests {
     }
 
     #[test]
-    fn invariant_4_https_and_trusted_dirs() {
+    fn invariant_4_no_remotes_and_trusted_dirs() {
         let mut root: Value = serde_json::from_str(&spec_json(base())).unwrap();
         root["remotes"] = json!([{"type": "streamable-http", "url": "http://x.example"}]);
         assert!(
             validate(&root.to_string(), FILE, |_| Some("/bin/x".into()))
                 .unwrap_err()
-                .contains("https")
+                .contains("remote upstreams are not brokered")
         );
         assert!(
             validate(&spec_json(base()), FILE, |_| None)
