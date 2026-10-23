@@ -2408,7 +2408,12 @@ mod e2e_tests {
         let server = home_path.join("fake_mcp.py");
         std::fs::write(
             &server,
-            r#"import sys, json
+            r#"import sys, json, os, socket
+def probe(target):
+    host, port = os.environ["HTTPS_PROXY"].rsplit(":", 1)
+    s = socket.create_connection((host.split("//")[1], int(port)), timeout=5)
+    s.sendall(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n").encode())
+    return s.recv(64).decode().split("\r\n")[0]
 for line in sys.stdin:
     m = json.loads(line)
     if "id" not in m:
@@ -2418,6 +2423,8 @@ for line in sys.stdin:
         r = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
     elif meth == "tools/list":
         r = {"tools": [{"name": "echo", "inputSchema": {}}, {"name": "delete_everything", "inputSchema": {}}]}
+    elif meth == "tools/call" and m["params"]["name"] == "probe":
+        r = {"content": [{"type": "text", "text": "PROBE:" + probe("example.com:443") + "|" + probe("example.org:80")}]}
     elif meth == "tools/call":
         r = {"content": [{"type": "text", "text": "SERVER-RAN:" + m["params"]["name"]}]}
     else:
@@ -2435,7 +2442,8 @@ for line in sys.stdin:
                 "v": 1,
                 "credential": "none",
                 "command": ["python3", server.display().to_string()],
-                "tools": {"allow": ["echo"]}
+                "egressHosts": ["example.org"],
+                "tools": {"allow": ["echo", "probe"]}
             }}
         });
         std::fs::write(spec_dir.join("io.example__fake-mcp.json"), spec.to_string()).unwrap();
@@ -2458,6 +2466,7 @@ msgs = [
     {{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}},
     {{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {{"name": "delete_everything", "arguments": {{}}}}}},
     {{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {{"name": "echo", "arguments": {{}}}}}},
+    {{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {{"name": "probe", "arguments": {{}}}}}},
 ]
 for m in msgs:
     p.stdin.write(json.dumps(m) + "\n")
@@ -2465,13 +2474,25 @@ for m in msgs:
     print("RESP:" + p.stdout.readline().strip(), flush=True)
 p.stdin.close()
 p.wait()
+# The spec's egress host must not have joined the agent's allowlist.
+import socket
+host, port = os.environ["HTTPS_PROXY"].rsplit(":", 1)
+s = socket.create_connection((host.split("//")[1], int(port)), timeout=5)
+s.sendall(b"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\n\r\n")
+print("AGENT:" + s.recv(64).decode().split("\r\n")[0])
 "#,
                 cplt = binary_path().display()
             ),
         )
         .unwrap();
         let out = cplt_cmd()
-            .args(["--yes", "--no-validate", "--agent", "copilot"])
+            .args([
+                "--yes",
+                "--no-validate",
+                "--default-allowlist",
+                "--agent",
+                "copilot",
+            ])
             .env("HOME", &home_path)
             .env_remove("XDG_CONFIG_HOME")
             .env(
@@ -2488,9 +2509,9 @@ p.wait()
             .filter_map(|l| l.strip_prefix("RESP:"))
             .map(|l| serde_json::from_str(l).expect("a JSON-RPC line"))
             .collect();
-        assert_eq!(resp.len(), 4, "stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(resp.len(), 5, "stdout: {stdout}\nstderr: {stderr}");
         assert!(
-            stdout.contains("ENTRY:fake-mcp:cplt mcp-stdio io.example/fake-mcp"),
+            stdout.contains("ENTRY:io.example__fake-mcp:cplt mcp-stdio io.example/fake-mcp"),
             "{stdout}"
         );
         assert_eq!(resp[0]["result"]["serverInfo"]["name"], "fake");
@@ -2511,6 +2532,20 @@ p.wait()
         assert!(
             stderr.contains("DENIED"),
             "the refusal is mirrored: {stderr}"
+        );
+        let probe = resp[4]["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            probe, "PROBE:HTTP/1.1 403 Forbidden|HTTP/1.1 403 Forbidden",
+            "{stdout}"
+        );
+        assert!(stderr.contains("egress → DENIED example.com"), "{stderr}");
+        let agent = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("AGENT:"))
+            .unwrap_or("");
+        assert!(
+            agent.starts_with("HTTP/1.1 403"),
+            "agent reached a spec-only host: {agent}\n{stdout}"
         );
     }
 

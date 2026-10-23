@@ -4481,11 +4481,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(cplt::worktree_broker::run_client(&name, &reference));
         }
     }
+    // `mcp status` reads specs exactly as a launch from here would, so it
+    // runs after the launch's config resolution below.
+    let mut mcp_status = None;
     match cli.command.take() {
         Some(Command::McpStdio { id }) => return Ok(cplt::mcp_broker::run_stdio(&id)),
         Some(Command::Mcp {
             action: McpAction::Status { json },
-        }) => return Ok(cplt::mcp_broker::run_status(json)),
+        }) => mcp_status = Some(json),
         other => cli.command = other,
     }
 
@@ -4724,20 +4727,28 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // dyld access to load Electron Framework from within the .app bundle.
     let electron_app_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
 
-    // Brokered MCP servers (#824). Before the proxy starts: their egress hosts
-    // join this session's allowlist. No spec files, no change.
-    let mcp_found = if resolved.mcp_broker && !cli.print_profile {
-        let writable = sandbox::session_writable_roots(
-            &project_dir,
-            &policy_roots,
-            &resolved.allow_write,
-            Some(&scratch::ScratchDir::base(&home_dir)),
-        );
-        cplt::mcp_broker::detect(&home_dir, &writable, &cli.no_mcp_broker)
+    // Brokered MCP servers (#824). No spec files, no change. Each child gets
+    // its own egress proxy; the session allowlist is not touched.
+    let mcp_writable = sandbox::session_writable_roots(
+        &project_dir,
+        &policy_roots,
+        &resolved.allow_write,
+        Some(&scratch::ScratchDir::base(&home_dir)),
+    );
+    if let Some(json) = mcp_status {
+        return Ok(cplt::mcp_broker::run_status(
+            json,
+            &home_dir,
+            &mcp_writable,
+            &cli.no_mcp_broker,
+            resolved.mcp_broker,
+        ));
+    }
+    let mcp_found = if resolved.mcp_broker {
+        cplt::mcp_broker::detect(&home_dir, &mcp_writable, &cli.no_mcp_broker)
     } else {
         cplt::mcp_broker::Detected::default()
     };
-    resolved.allow_domains.extend(mcp_found.egress_hosts());
 
     let AssembledSandbox {
         mut prepared,
@@ -6532,19 +6543,14 @@ fn assemble_sandbox(
         },
         _ => None,
     };
-    let mcp_broker = match (opts.mcp_specs, proxy_port_for_profile) {
-        ([], _) => None,
-        (_, None) => {
-            ui::warn(
-                "brokered MCP servers go through cplt's proxy, which is off: left as configured.",
-            );
-            None
-        }
-        (specs, Some(port)) => {
+    // Bound for `--print-profile` too, so the printed profile has its rule.
+    let mcp_broker = match opts.mcp_specs {
+        [] => None,
+        specs => {
             let log = cplt::mcp_broker::Log {
                 file: resolved.proxy_log_file.clone(),
             };
-            cplt::mcp_broker::Broker::start(specs.to_vec(), port, home_dir, log)
+            cplt::mcp_broker::Broker::start(specs.to_vec(), home_dir, log)
                 .inspect_err(|e| {
                     ui::warn(&format!("MCP broker unavailable: {e}. Left as configured."));
                 })

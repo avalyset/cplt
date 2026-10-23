@@ -2569,6 +2569,36 @@ fn the_worktree_broker_socket_is_one_exact_outbound_rule_when_set() {
     );
 }
 
+/// #824 MCP broker: the same one exact outbound rule, with its directory
+/// pinned, and nothing at all without a broker.
+#[test]
+fn the_mcp_broker_socket_is_one_exact_outbound_rule_when_set() {
+    let socket = PathBuf::from("/private/tmp/cplt-pw-0123456789abcdef/m");
+    let profile = |sock: Option<&std::path::Path>| {
+        generate_profile(
+            &SandboxConfig {
+                mcp_socket: sock,
+                ..base_profile_options()
+            },
+            &[],
+        )
+    };
+    let off = profile(None);
+    assert!(!off.contains("cplt mcp-stdio"), "{off}");
+    let on = profile(Some(&socket));
+    let block = format!(
+        ";; MCP broker socket (cplt mcp-stdio, #824)\n(allow network-outbound (remote unix-socket (path-literal \"{}\")))\n(deny file-write* (subpath \"{}\"))\n\n",
+        socket.display(),
+        socket.parent().unwrap().display()
+    );
+    assert_eq!(on.matches(&block).count(), 1, "{on}");
+    assert_eq!(
+        on.replace(&block, ""),
+        off,
+        "the block is the whole difference"
+    );
+}
+
 /// #531: the managed worktree root section, with the `.git` create denies of
 /// the #574 re-review, appears only when the root is set.
 #[test]

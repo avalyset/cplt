@@ -1113,17 +1113,19 @@ server, nav-pilot writes a broker spec to `~/.config/cplt/mcp/` (or
 on the host, outside the sandbox, and points your client's entry at
 `cplt mcp-stdio <id>`, which connects to it over a per-session socket.
 
-- The server gets a cleared environment. Its traffic goes through cplt's
-  proxy, and the spec's `egressHosts` join the session's allowlist.
+- The server gets a cleared environment. Its traffic goes through a proxy of
+  its own that allows only the spec's `egressHosts` on port 443. The agent's
+  allowlist does not change.
 - Only the tools in the spec's `tools.allow` are listed or callable. For
   `execute_graphql`, cplt refuses mutations, subscriptions and documents with
   more than one operation.
-- Copilot CLI gets `--additional-mcp-config` (and `--disable-mcp-server` for
-  a duplicate entry). OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
+- Copilot CLI gets `--additional-mcp-config` with an entry named after the
+  id (`io.github.nais__nais-mcp`), and `--disable-mcp-server` for your own
+  entries that run the same command. OpenCode v2 gets an overlay in `OPENCODE_CONFIG_CONTENT`.
   Your config files are not changed.
 - A spec cplt refuses prints one line at launch, and the entry stays as
-  configured. `cplt mcp status --json` lists the specs, their state and the
-  reasons for any refusal.
+  configured. `cplt mcp status --json`, run in the project, lists the specs, their
+  state and the reasons for any refusal, checked as a launch there would.
 
 With no spec files nothing changes. Turn the broker off with
 `sandbox.mcp_broker = false`, or turn off one server for a run with

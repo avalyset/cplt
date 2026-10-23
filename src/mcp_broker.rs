@@ -51,6 +51,12 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// JSON-RPC error code for a request the broker refuses.
 const DENIED: i64 = -32001;
+/// Notifications a client may send through.
+const CLIENT_NOTIFICATIONS: &[&str] = &[
+    "notifications/initialized",
+    "notifications/cancelled",
+    "notifications/roots/list_changed",
+];
 
 /// cplt's credential mechanisms (design section 7). Hand-kept; tool policy is
 /// never here. `gh-token` is served by [`crate::github_mcp`], not by specs.
@@ -115,6 +121,11 @@ impl Spec {
     /// The client entry name when the user has none: the id's last segment.
     fn short_name(&self) -> &str {
         self.id.rsplit('/').next().unwrap_or(&self.id)
+    }
+
+    /// The whole id as an entry name (`/` as `__`, as in the file name).
+    fn full_name(&self) -> String {
+        self.id.replace('/', "__")
     }
 }
 
@@ -404,14 +415,6 @@ pub struct Detected {
     pub rejected: Vec<Rejected>,
     /// Skipped by `--no-mcp-broker`.
     pub disabled: Vec<String>,
-}
-
-impl Detected {
-    pub fn egress_hosts(&self) -> impl Iterator<Item = String> + '_ {
-        self.specs
-            .iter()
-            .flat_map(|s| s.egress_hosts.iter().cloned())
-    }
 }
 
 /// Load every spec in `dir`. A file in `writable` (a tree the sandbox can
@@ -739,8 +742,20 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         return Action::Drop;
     };
     let Some(id) = obj.get("id") else {
-        return Action::Forward(line.to_string());
+        // Notifications: only the ones a client sends, never a method that
+        // policy checks (a server may answer an id-less call anyway).
+        return if CLIENT_NOTIFICATIONS.contains(&method) {
+            Action::Forward(msg.to_string())
+        } else {
+            Action::Drop
+        };
     };
+    if pending.0.contains_key(&id.to_string()) {
+        return Action::Reply(
+            error_line(id, DENIED, "cplt: request id already in flight"),
+            Some(format!("{method} → DENIED duplicate id")),
+        );
+    }
     let deny = |why: String| {
         Action::Reply(
             error_line(id, DENIED, &format!("cplt: {why}")),
@@ -773,6 +788,17 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
                 ));
             }
             if spec.graphql.contains(tool) {
+                // A server that folds case would see another key as `query`.
+                let shadow = msg
+                    .pointer("/params/arguments")
+                    .and_then(Value::as_object)
+                    .is_some_and(|a| {
+                        a.keys()
+                            .any(|k| k != "query" && k.eq_ignore_ascii_case("query"))
+                    });
+                if shadow {
+                    return deny(format!("{tool}: an argument key folds to query"));
+                }
                 let query = msg
                     .pointer("/params/arguments/query")
                     .and_then(Value::as_str);
@@ -793,7 +819,9 @@ pub fn on_client(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
         );
     }
     pending.0.insert(id.to_string(), method.to_string());
-    Action::Forward(line.to_string())
+    // Re-serialized: the server parses exactly what was checked, whatever
+    // its JSON parser does with duplicate keys or odd escapes.
+    Action::Forward(msg.to_string())
 }
 
 /// A message from the server, on its way to the client.
@@ -818,9 +846,9 @@ pub fn on_server(line: &str, spec: &Spec, pending: &mut Pending) -> Action {
     else {
         return Action::Drop;
     };
-    if method == "tools/list"
-        && let Some(Value::Array(tools)) = obj.get_mut("result").and_then(|r| r.get_mut("tools"))
-    {
+    // Filtered whatever the request was: an id cannot smuggle a tool list.
+    let _ = method;
+    if let Some(Value::Array(tools)) = obj.get_mut("result").and_then(|r| r.get_mut("tools")) {
         tools.retain(|t| {
             t.get("name")
                 .and_then(Value::as_str)
@@ -873,11 +901,12 @@ struct Server {
     /// The live child, if a client is connected. One per server.
     child: Mutex<Option<Arc<Mutex<Child>>>>,
     spawns: Mutex<VecDeque<Instant>>,
+    /// This server's own CONNECT proxy, allowing only its `egressHosts`.
+    egress_port: u16,
 }
 
 struct Shared {
     servers: BTreeMap<String, Server>,
-    proxy_port: u16,
     home: PathBuf,
     log: Log,
     stop: AtomicBool,
@@ -896,7 +925,7 @@ impl Broker {
     /// Bind the socket and serve `specs`. The child's egress goes through the
     /// proxy on `proxy_port`, whose allowlist already holds the specs' hosts.
     #[cfg(target_os = "macos")]
-    pub fn start(specs: Vec<Spec>, proxy_port: u16, home: &Path, log: Log) -> Result<Self, String> {
+    pub fn start(specs: Vec<Spec>, home: &Path, log: Log) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::scratch::PlaywrightSocketDir::create()?;
         let socket = dir.path().join("m");
@@ -907,23 +936,46 @@ impl Broker {
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("cannot poll {}: {e}", socket.display()))?;
+        let mut egress = Vec::new();
+        let mut servers = BTreeMap::new();
+        for spec in specs {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.set_nonblocking(true).map(|()| l))
+                .map_err(|e| format!("cannot start the egress proxy: {e}"))?;
+            let egress_port = l.local_addr().map_err(|e| e.to_string())?.port();
+            egress.push((spec.id.clone(), l));
+            let server = Server {
+                spec,
+                child: Mutex::new(None),
+                spawns: Mutex::new(VecDeque::new()),
+                egress_port,
+            };
+            servers.insert(server.spec.id.clone(), server);
+        }
         let shared = Arc::new(Shared {
-            servers: specs
-                .into_iter()
-                .map(|s| {
-                    let server = Server {
-                        spec: s,
-                        child: Mutex::new(None),
-                        spawns: Mutex::new(VecDeque::new()),
-                    };
-                    (server.spec.id.clone(), server)
-                })
-                .collect(),
-            proxy_port,
+            servers,
             home: home.to_path_buf(),
             log,
             stop: AtomicBool::new(false),
         });
+        for (id, l) in egress {
+            let s = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let Some(server) = s.servers.get(&id) else {
+                    return;
+                };
+                while !s.stop.load(Ordering::Acquire) {
+                    match l.accept() {
+                        Ok((stream, _)) => {
+                            let hosts = server.spec.egress_hosts.clone();
+                            let (log, id) = (s.log.clone(), id.clone());
+                            std::thread::spawn(move || egress_tunnel(stream, &hosts, &log, &id));
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                    }
+                }
+            });
+        }
         let s = Arc::clone(&shared);
         let thread = std::thread::spawn(move || {
             while !s.stop.load(Ordering::Acquire) {
@@ -946,7 +998,7 @@ impl Broker {
 
     /// Linux needs a bwrap bind for the socket first (phase 1b).
     #[cfg(not(target_os = "macos"))]
-    pub fn start(_: Vec<Spec>, _: u16, _: &Path, _: Log) -> Result<Self, String> {
+    pub fn start(_: Vec<Spec>, _: &Path, _: Log) -> Result<Self, String> {
         Err("the MCP broker runs on macOS only for now".into())
     }
 
@@ -979,17 +1031,23 @@ impl Drop for Broker {
 /// SIGTERM, a short grace, SIGKILL, then reap.
 fn kill(child: &Mutex<Child>) {
     let Ok(mut child) = child.lock() else { return };
+    // Reaped (or unknown): its pid may belong to someone else now.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
     if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: plain kill(2) on our own unreaped child.
+        // SAFETY: kill(2) on our own child, which try_wait just saw unreaped
+        // and which nothing else reaps (we hold its lock).
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let start = Instant::now();
     while start.elapsed() < KILL_GRACE {
-        if let Ok(Some(_)) = child.try_wait() {
+        if !matches!(child.try_wait(), Ok(None)) {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Still unreaped under our lock, so the pid is still ours.
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1013,8 +1071,9 @@ fn write_line(w: &Mutex<impl Write>, line: &str) -> bool {
         .is_ok()
 }
 
-fn spawn_child(shared: &Shared, spec: &Spec) -> std::io::Result<Child> {
-    let proxy = format!("http://127.0.0.1:{}", shared.proxy_port);
+fn spawn_child(shared: &Shared, server: &Server) -> std::io::Result<Child> {
+    let spec = &server.spec;
+    let proxy = format!("http://127.0.0.1:{}", server.egress_port);
     #[allow(clippy::disallowed_methods)] // resolved in the trusted dirs at load
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.command[1..])
@@ -1026,6 +1085,8 @@ fn spawn_child(shared: &Shared, spec: &Spec) -> std::io::Result<Child> {
         .env("HTTP_PROXY", &proxy)
         .env("https_proxy", &proxy)
         .env("http_proxy", &proxy)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // ponytail: stderr dropped; route it to the proxy log, bounded and
@@ -1035,6 +1096,125 @@ fn spawn_child(shared: &Shared, spec: &Spec) -> std::io::Result<Child> {
         cmd.env("LANG", lang);
     }
     cmd.spawn()
+}
+
+/// The egress decision for a CONNECT target: port 443 only, host equal to
+/// or a subdomain of an `egressHosts` entry. Returns the host to dial.
+pub fn egress_allowed(target: &str, hosts: &[String]) -> Result<String, String> {
+    let (host, port) = target.rsplit_once(':').ok_or("no port")?;
+    if port != "443" {
+        return Err(format!("port {port}"));
+    }
+    let host = crate::proxy::normalize_hostname(host);
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err("not a hostname".into());
+    }
+    if hosts
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    {
+        Ok(host)
+    } else {
+        Err(format!("{host} is not in egressHosts"))
+    }
+}
+
+/// A public address: the child must not be steered at loopback or the LAN
+/// through a name it is allowed.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            !(v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.octets()[0] == 100 && v.octets()[1] & 0xc0 == 64)
+        }
+        std::net::IpAddr::V6(v) => {
+            let s = v.segments()[0];
+            !(v.is_loopback() || v.is_unspecified() || s & 0xfe00 == 0xfc00 || s & 0xffc0 == 0xfe80)
+                && v.to_ipv4_mapped().is_none_or(|m| public_ip(m.into()))
+        }
+    }
+}
+
+/// One child connection to its egress proxy: a CONNECT head, the policy
+/// check, then bytes both ways. Anything else gets 403.
+fn egress_tunnel(client: std::net::TcpStream, hosts: &[String], log: &Log, id: &str) {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let _ = client.set_nonblocking(false);
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let Ok(read_half) = client.try_clone() else {
+        return;
+    };
+    let mut r = BufReader::new(read_half);
+    let Some(first) = read_line(&mut r, 2048) else {
+        return;
+    };
+    // Skip the rest of the head.
+    loop {
+        match read_line(&mut r, 8192) {
+            Some(l) if l.is_empty() => break,
+            Some(_) => {}
+            None => return,
+        }
+    }
+    let mut w = &client;
+    let mut parts = first.split(' ');
+    let decision = match (parts.next(), parts.next()) {
+        (Some("CONNECT"), Some(target)) => egress_allowed(target, hosts),
+        _ => Err("only CONNECT is proxied".into()),
+    };
+    let upstream = decision.and_then(|host| {
+        let addrs: Vec<_> = (host.as_str(), 443)
+            .to_socket_addrs()
+            .map_err(|e| format!("{host}: {e}"))?
+            .filter(|a| public_ip(a.ip()))
+            .collect();
+        let mut last = String::from("no public address");
+        for a in &addrs {
+            match TcpStream::connect_timeout(a, Duration::from_secs(10)) {
+                Ok(s) => return Ok(s),
+                Err(e) => last = format!("{a}: {e}"),
+            }
+        }
+        Err(format!("CONNECT-FAIL {host} ({last})"))
+    });
+    let upstream = match upstream {
+        Ok(u) => u,
+        Err(why) => {
+            log.line(id, &format!("egress → DENIED {why}"));
+            let _ = w.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+            return;
+        }
+    };
+    if w.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    let _ = client.set_read_timeout(None);
+    let (Ok(mut up_w), Ok(mut down_w)) = (upstream.try_clone(), client.try_clone()) else {
+        return;
+    };
+    // Bytes the head reader buffered past the blank line go first.
+    let buffered = r.buffer().to_vec();
+    let mut r = r.into_inner();
+    let up = std::thread::spawn(move || {
+        if up_w.write_all(&buffered).is_ok() {
+            let _ = std::io::copy(&mut r, &mut up_w);
+        }
+        let _ = up_w.shutdown(std::net::Shutdown::Write);
+    });
+    let mut upstream = upstream;
+    let _ = std::io::copy(&mut upstream, &mut down_w);
+    let _ = down_w.shutdown(std::net::Shutdown::Both);
+    let _ = up.join();
 }
 
 /// One client connection: the id line, then JSON-RPC lines both ways until
@@ -1095,7 +1275,7 @@ fn serve(shared: &Shared, stream: UnixStream) {
             return;
         }
         spawns.push_back(Instant::now());
-        match spawn_child(shared, spec) {
+        match spawn_child(shared, server) {
             Ok(c) => {
                 let c = Arc::new(Mutex::new(c));
                 *slot = Some(Arc::clone(&c));
@@ -1304,18 +1484,37 @@ pub fn opencode_overlay(
         names.sort();
         names.dedup();
         if names.is_empty() {
-            names.push((true, spec.short_name().to_string()));
+            let short = spec.short_name();
+            let taken = configs.iter().any(|c| {
+                c.pointer("/mcp/servers")
+                    .and_then(|m| m.get(short))
+                    .is_some()
+                    || c.pointer("/mcp").and_then(|m| m.get(short)).is_some()
+            });
+            names.push((
+                true,
+                if taken {
+                    spec.full_name()
+                } else {
+                    short.to_string()
+                },
+            ));
         }
         for (v2, name) in names {
             let mut parent = object_at(&mut root, "mcp")?;
             if v2 {
                 parent = object_at(parent, "servers")?;
             }
-            let entry = object_at(parent, &name)?;
-            entry.insert("type".into(), "local".into());
-            entry.insert("command".into(), json!(["cplt", "mcp-stdio", spec.id]));
-            object_at(entry, "environment")?
-                .insert(SOCKET_ENV.into(), socket.display().to_string().into());
+            // Wholesale, so nothing of a same-named entry in this value
+            // survives. OpenCode still deep-merges keys from the files.
+            parent.insert(
+                name,
+                json!({
+                    "type": "local",
+                    "command": ["cplt", "mcp-stdio", spec.id],
+                    "environment": {SOCKET_ENV: socket.display().to_string()},
+                }),
+            );
         }
     }
     Some(Value::Object(root).to_string())
@@ -1351,11 +1550,10 @@ pub fn copilot_args(mcp_config: Option<&str>, specs: &[&Spec], socket: &Path) ->
             .map(|(n, _)| n)
             .collect();
         matching.sort();
-        let name = matching
-            .first()
-            .map_or(spec.short_name(), |n| n.as_str())
-            .to_string();
-        for other in matching.iter().skip(1) {
+        // Its own name: whether --additional-mcp-config wins over a
+        // same-named user entry is not documented, so never share one.
+        let name = spec.full_name();
+        for other in &matching {
             args.push("--disable-mcp-server".into());
             args.push((*other).clone());
         }
@@ -1425,25 +1623,20 @@ pub fn copilot(home: &Path, broker: &Broker) -> Vec<String> {
 
 /// `cplt mcp status [--json]`. Reads the specs as a launch from the current
 /// directory would, without starting anything.
-pub fn run_status(as_json: bool) -> ExitCode {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        eprintln!("cplt mcp status: HOME is not set");
-        return ExitCode::FAILURE;
-    };
-    let enabled = crate::config::Config::load_file()
-        .ok()
-        .flatten()
-        .and_then(|l| l.config.sandbox.mcp_broker)
-        .unwrap_or(true);
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let writable = crate::sandbox::session_writable_roots(&cwd, &[], &[], None);
-    let found = load(&spec_dir(&home), &writable, &[]);
+pub fn run_status(
+    as_json: bool,
+    home: &Path,
+    writable: &[PathBuf],
+    disabled: &[String],
+    enabled: bool,
+) -> ExitCode {
+    let found = load(&spec_dir(home), writable, disabled);
     let status = status_json(&found, enabled && cfg!(target_os = "macos"), true);
     if as_json {
         println!("{status}");
         return ExitCode::SUCCESS;
     }
-    println!("MCP broker specs in {}", spec_dir(&home).display());
+    println!("MCP broker specs in {}", spec_dir(home).display());
     for s in status["servers"].as_array().into_iter().flatten() {
         println!(
             "  {}  {}  credential_ok: {}",
@@ -1795,14 +1988,186 @@ mod tests {
         let cfg = r#"{"mcpServers":{"b":{"command":"nais","args":["alpha","mcp","serve"]},"a":{"command":"nais","args":["alpha","mcp","serve"]},"c":{"command":"x"}}}"#;
         let args = copilot_args(Some(cfg), &[&s], sock);
         assert_eq!(
-            args[..3],
-            ["--disable-mcp-server", "b", "--additional-mcp-config"]
+            args[..5],
+            [
+                "--disable-mcp-server",
+                "a",
+                "--disable-mcp-server",
+                "b",
+                "--additional-mcp-config"
+            ]
         );
-        let v: Value = serde_json::from_str(&args[3]).unwrap();
+        let v: Value = serde_json::from_str(&args[5]).unwrap();
         assert_eq!(
-            v["mcpServers"]["a"]["args"],
+            v["mcpServers"]["io.github.nais__nais-mcp"]["args"],
             json!(["mcp-stdio", "io.github.nais/nais-mcp"])
         );
         assert!(copilot_args(None, &[], sock).is_empty());
+    }
+
+    #[test]
+    fn id_less_calls_never_pass() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        for m in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"delete_app"}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"1999"}}"#,
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#,
+        ] {
+            assert_eq!(on_client(m, &s, &mut p), Action::Drop, "{m}");
+        }
+        let ok = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(matches!(on_client(ok, &s, &mut p), Action::Forward(_)));
+    }
+
+    #[test]
+    fn forwards_what_it_checked() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        // serde keeps the last duplicate; the server must see the same.
+        let dup = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_app","name":"get_nais_context"}}"#;
+        let Action::Forward(out) = on_client(dup, &s, &mut p) else {
+            panic!()
+        };
+        assert!(!out.contains("delete_app"), "{out}");
+        let fold = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_graphql","arguments":{"query":"{ a }","Query":"mutation { x }"}}}).to_string();
+        assert!(matches!(on_client(&fold, &s, &mut p), Action::Reply(..)));
+    }
+
+    #[test]
+    fn duplicate_ids_and_smuggled_tool_lists() {
+        let s = check(base()).unwrap();
+        let mut p = Pending::default();
+        let ping = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
+        assert!(matches!(on_client(ping, &s, &mut p), Action::Forward(_)));
+        let list = r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
+        assert!(matches!(on_client(list, &s, &mut p), Action::Reply(..)));
+        let resp = r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"delete_app"}]}}"#;
+        let Action::Forward(out) = on_server(resp, &s, &mut p) else {
+            panic!()
+        };
+        assert!(!out.contains("delete_app"), "{out}");
+    }
+
+    #[test]
+    fn egress_policy() {
+        let hosts = vec!["console.nav.cloud.nais.io".to_string()];
+        assert!(egress_allowed("console.nav.cloud.nais.io:443", &hosts).is_ok());
+        assert!(egress_allowed("x.console.nav.cloud.nais.io:443", &hosts).is_ok());
+        assert!(egress_allowed("console.nav.cloud.nais.io:80", &hosts).is_err());
+        assert!(egress_allowed("evilconsole.nav.cloud.nais.io:443", &hosts).is_err());
+        assert!(egress_allowed("example.com:443", &hosts).is_err());
+        assert!(!public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("10.1.2.3".parse().unwrap()));
+        assert!(!public_ip("::ffff:192.168.0.1".parse().unwrap()));
+        assert!(public_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn kill_terminates_and_never_signals_a_reaped_child() {
+        #[allow(clippy::disallowed_methods)]
+        let c = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let c = Mutex::new(c);
+        let start = Instant::now();
+        kill(&c);
+        assert!(start.elapsed() < KILL_GRACE + Duration::from_secs(1));
+        assert!(matches!(c.lock().unwrap().try_wait(), Ok(Some(_))));
+        kill(&c); // already reaped: returns at once, no signal
+        // SIGTERM ignored: SIGKILL after the grace.
+        #[allow(clippy::disallowed_methods)]
+        let c = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let c = Mutex::new(c);
+        kill(&c);
+        assert!(matches!(c.lock().unwrap().try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn overlay_names_never_collide() {
+        let s = check(base()).unwrap();
+        let sock = Path::new("/private/tmp/x/m");
+        let other = json!({"mcp": {"servers": {"nais-mcp": {"type": "remote", "url": "https://x.example"}}}});
+        let out: Value =
+            serde_json::from_str(&opencode_overlay(None, &[other], &[&s], sock).unwrap()).unwrap();
+        assert!(out["mcp"]["servers"].get("nais-mcp").is_none(), "{out}");
+        assert_eq!(
+            out["mcp"]["servers"]["io.github.nais__nais-mcp"]["type"],
+            "local"
+        );
+        let existing = r#"{"mcp":{"servers":{"nais":{"command":["nais","alpha","mcp","serve"],"oauth":true}}}}"#;
+        let user: Value = serde_json::from_str(existing).unwrap();
+        let out: Value =
+            serde_json::from_str(&opencode_overlay(Some(existing), &[user], &[&s], sock).unwrap())
+                .unwrap();
+        assert!(
+            out["mcp"]["servers"]["nais"].get("oauth").is_none(),
+            "wholesale: {out}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cat_broker() -> Broker {
+        let mut spec = check(base()).unwrap();
+        spec.command = vec!["cat".into()];
+        spec.program = "/bin/cat".into();
+        Broker::start(vec![spec], Path::new("/tmp"), Log { file: None }).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn connect(b: &Broker) -> (UnixStream, BufReader<UnixStream>) {
+        let mut s = UnixStream::connect(b.socket()).unwrap();
+        writeln!(s, "io.github.nais/nais-mcp").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let r = BufReader::new(s.try_clone().unwrap());
+        (s, r)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_free(b: &Broker) {
+        let server = &b.shared.servers["io.github.nais/nais-mcp"];
+        let start = Instant::now();
+        while server.child.lock().unwrap().is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "child slot never freed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_second_client_is_refused() {
+        let b = cat_broker();
+        let (mut a, mut ra) = connect(&b);
+        // A round trip proves the child is up and bound to `a`.
+        writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        let (_b2, mut rb) = connect(&b);
+        let mut l = String::new();
+        rb.read_line(&mut l).unwrap();
+        assert!(l.contains("already has a client"), "{l}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_restart_budget_stops_respawns() {
+        let b = cat_broker();
+        for _ in 0..SPAWNS_PER_MINUTE {
+            let (mut a, mut ra) = connect(&b);
+            writeln!(a, r#"{{"jsonrpc":"2.0","id":1,"method":"ping"}}"#).unwrap();
+            let mut l = String::new();
+            ra.read_line(&mut l).unwrap();
+            drop((a, ra));
+            wait_free(&b);
+        }
+        let (_a, mut ra) = connect(&b);
+        let mut l = String::new();
+        ra.read_line(&mut l).unwrap();
+        assert!(l.contains("too many restarts"), "{l}");
     }
 }
