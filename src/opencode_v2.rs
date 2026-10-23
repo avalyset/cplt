@@ -73,6 +73,8 @@ pub struct Session {
 pub struct Carried {
     /// The session's dir holding it, opened before the agent runs.
     dir: std::fs::File,
+    /// The host dir it goes back to, pinned at [`prepare`].
+    host: std::fs::File,
     name: &'static str,
     /// The host file as copied in; `None`: there was none.
     before: Option<String>,
@@ -118,7 +120,7 @@ pub fn prepare(scratch: &Path, home: &Path, launch_dir: &Path) -> Result<Session
     let model = carry_in_state(&state_base.join("opencode"), &state.join("opencode"))
         .and_then(|m| Ok((open_dir(&state.join("opencode")).map_err(|_| ())?, m)));
     let tui = carry_in_tui(
-        &state_base.join("opencode").join(TUI_DIR),
+        &state_base.join("opencode"),
         &state.join("opencode").join(TUI_DIR),
     );
     let explicit = global_config_file(&user_oc);
@@ -244,7 +246,17 @@ fn carry_in_state(host: &Path, own: &Path) -> Result<Option<String>, ()> {
 /// Copy `host/name` into `own`. `Err`: refused or not copied, so the host
 /// file must be left alone at exit.
 fn carry_in_file(host: &Path, own: &Path, name: &str, limit: u64) -> Result<Option<String>, ()> {
-    let text = match crate::untrusted::read_untrusted(&host.join(name), limit) {
+    let host = open_host_dir(host).map_err(|_| ())?;
+    carry_in_at(&host, own, name, limit)
+}
+
+fn carry_in_at(
+    host: &std::fs::File,
+    own: &Path,
+    name: &str,
+    limit: u64,
+) -> Result<Option<String>, ()> {
+    let text = match crate::untrusted::read_untrusted_at(host, name, limit) {
         Ok(Some(t)) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         // A link (a dotfile manager's), FIFO or oversized file: never copied
@@ -260,16 +272,24 @@ const TUI_LIMIT: u64 = 1 << 20;
 
 /// Copy the host TUI files into the session's `latest/tui`. Best effort: a
 /// failure brings back the "What's new" dialog or loses tabs, not the session.
-fn carry_in_tui(host: &Path, own: &Path) -> Vec<Carried> {
+fn carry_in_tui(host_oc: &Path, own: &Path) -> Vec<Carried> {
     if std::fs::create_dir_all(own).is_err() {
         return Vec::new();
     }
+    let host = match open_host_tui(host_oc) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::ui::warn(&format!("OpenCode v2: TUI state not carried: {e}"));
+            return Vec::new();
+        }
+    };
     TUI_FILES
         .iter()
         .filter_map(|&name| {
-            let before = carry_in_file(host, own, name, TUI_LIMIT).ok()?;
+            let before = carry_in_at(&host, own, name, TUI_LIMIT).ok()?;
             Some(Carried {
                 dir: open_dir(own).ok()?,
+                host: host.try_clone().ok()?,
                 name,
                 before,
             })
@@ -277,13 +297,55 @@ fn carry_in_tui(host: &Path, own: &Path) -> Vec<Carried> {
         .collect()
 }
 
-/// Copy the session's TUI files back to the host, like [`save_model`].
-pub fn save_tui(carried: &[Carried], home: &Path) {
-    let host = xdg_base("XDG_STATE_HOME", home, ".local/state")
-        .join("opencode")
-        .join(TUI_DIR);
+/// `host_oc/latest/tui`, opened and created one component at a time without
+/// following links. Those components sit in a dir an earlier v1 session (or
+/// a v2 session whose state and data dirs coincide) could write, so a link
+/// planted at `latest` or `tui` must not send the parent's reads or writes
+/// elsewhere. `host_oc` itself is not agent-replaceable: its parent is never
+/// granted. The returned fd pins the dir for copy-in and copy-back alike.
+fn open_host_tui(host_oc: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut dir = open_host_dir(host_oc)?;
+    for part in TUI_DIR.split('/') {
+        let name = std::ffi::CString::new(part)?;
+        // SAFETY: `dir` is an open dir fd and `name` is NUL-terminated.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(e);
+            }
+        }
+        // SAFETY: as above; the result is checked before use.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned here.
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+
+/// The host `$XDG_STATE_HOME/opencode`. Its ancestors are the user's, so a
+/// link there (a dotfile manager's) is followed, as before.
+fn open_host_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)
+}
+
+/// Copy the session's TUI files back through the host dir pinned at
+/// [`prepare`], like [`save_model`].
+pub fn save_tui(carried: &[Carried]) {
     for c in carried {
-        if let Err(e) = save_file_to(&c.dir, &host, c.name, TUI_LIMIT, c.before.as_deref()) {
+        if let Err(e) = save_file_at(&c.dir, &c.host, c.name, TUI_LIMIT, c.before.as_deref()) {
             crate::ui::warn(&format!("OpenCode v2: {} not saved: {e}", c.name));
         }
     }
@@ -308,18 +370,22 @@ fn open_dir(dir: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn save_model_to(own: &std::fs::File, host: &Path, before: Option<&str>) -> Result<(), String> {
-    save_file_to(own, host, "model.json", MODEL_LIMIT, before)
+    std::fs::create_dir_all(host).map_err(|e| e.to_string())?;
+    let host = open_host_dir(host).map_err(|e| e.to_string())?;
+    save_file_at(own, &host, "model.json", MODEL_LIMIT, before)
 }
 
-/// Copy `name` from the session dir `own` to `host` if it changed and is
-/// JSON, via an `O_EXCL` temp file and a rename.
-fn save_file_to(
+/// Copy `name` from the session dir `own` into the host dir `host` if it
+/// changed and is JSON: an `O_EXCL|O_NOFOLLOW` temp file and a `renameat`,
+/// both relative to `host`, so no path component is resolved again.
+fn save_file_at(
     own: &std::fs::File,
-    host: &Path,
+    host: &std::fs::File,
     name: &str,
     limit: u64,
     before: Option<&str>,
 ) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     let text = match crate::untrusted::read_untrusted_at(own, name, limit) {
         Ok(Some(t)) => t,
         Ok(None) => {
@@ -336,19 +402,37 @@ fn save_file_to(
     }
     serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| format!("{name} is not JSON: {e}"))?;
-    std::fs::create_dir_all(host).map_err(|e| e.to_string())?;
-    let tmp = host.join(format!(".{name}.cplt-{}", std::process::id()));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()))
-        .and_then(|()| std::fs::rename(&tmp, host.join(name)))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            e.to_string()
-        })
+    let cstr = |s: String| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let tmp = cstr(format!(".{name}.cplt-{}", std::process::id()))?;
+    let dst = cstr(name.to_owned())?;
+    let at = host.as_raw_fd();
+    // SAFETY: `at` is an open dir fd and `tmp` is NUL-terminated; checked.
+    let fd = unsafe {
+        libc::openat(
+            at,
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: `fd` was just opened and is owned here.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let done = f.write_all(text.as_bytes()).and_then(|()| {
+        // SAFETY: both names are NUL-terminated, relative to the open `at`.
+        if unsafe { libc::renameat(at, tmp.as_ptr(), at, dst.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    done.map_err(|e| {
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(at, tmp.as_ptr(), 0) };
+        e.to_string()
+    })
 }
 
 /// The user's global `opencode.json(c)`, spelled under `user_oc`, for v2 to
@@ -1371,15 +1455,18 @@ mod tests {
     #[test]
     fn state_carries_tui_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let (host, own) = (tmp.path().join("host/tui"), tmp.path().join("own/tui"));
-        assert!(carry_in_tui(&host, &own).iter().all(|c| c.before.is_none()));
+        let (oc, own) = (tmp.path().join("host"), tmp.path().join("own/tui"));
+        let host = oc.join(TUI_DIR);
+        std::fs::create_dir_all(&oc).unwrap();
+        let carried = carry_in_tui(&oc, &own);
+        assert!(carried.iter().all(|c| c.before.is_none()));
+        assert!(host.is_dir(), "a missing host dir is made at start");
 
-        std::fs::create_dir_all(&host).unwrap();
         std::fs::write(host.join("highlights.json"), r#"{"seen":"2.1.3"}"#).unwrap();
         let target = tmp.path().join("dotfile.json");
         std::fs::write(&target, r#"{"tabs":1}"#).unwrap();
         std::os::unix::fs::symlink(&target, host.join("tabs.json")).unwrap();
-        let carried = carry_in_tui(&host, &own);
+        let carried = carry_in_tui(&oc, &own);
         assert_eq!(carried.len(), 1, "the linked tabs.json is refused");
         assert_eq!(carried[0].name, "highlights.json");
         assert_eq!(
@@ -1390,12 +1477,7 @@ mod tests {
 
         // Unchanged: left alone.
         std::fs::write(host.join("highlights.json"), r#"{"seen":"9"}"#).unwrap();
-        let save = |c: &Carried, host: &Path| {
-            save_file_to(&c.dir, host, c.name, TUI_LIMIT, c.before.as_deref()).unwrap();
-        };
-        for c in &carried {
-            save(c, &host);
-        }
+        save_tui(&carried);
         assert_eq!(
             std::fs::read_to_string(host.join("highlights.json")).unwrap(),
             r#"{"seen":"9"}"#
@@ -1403,9 +1485,7 @@ mod tests {
 
         std::fs::write(own.join("tabs.json"), r#"{"agent":1}"#).unwrap();
         std::fs::write(own.join("highlights.json"), r#"{"seen":"2.2.0"}"#).unwrap();
-        for c in &carried {
-            save(c, &host);
-        }
+        save_tui(&carried);
         assert_eq!(
             std::fs::read_to_string(host.join("highlights.json")).unwrap(),
             r#"{"seen":"2.2.0"}"#
@@ -1416,20 +1496,62 @@ mod tests {
                 .unwrap()
                 .is_symlink()
         );
-
-        // A host dir missing at start is created at exit.
-        let fresh = tmp.path().join("fresh/tui");
-        let own2 = tmp.path().join("own2/tui");
-        let carried = carry_in_tui(&fresh, &own2);
-        std::fs::write(own2.join("tabs.json"), "{}").unwrap();
-        for c in &carried {
-            save(c, &fresh);
-        }
         assert_eq!(
-            std::fs::read_to_string(fresh.join("tabs.json")).unwrap(),
-            "{}"
+            std::fs::read_dir(&host).unwrap().count(),
+            2,
+            "no temp left behind"
         );
-        assert!(!fresh.join("highlights.json").exists());
+    }
+
+    /// A link planted at `latest` or `tui` (by an earlier v1 session) is not
+    /// followed: nothing is read through it, and nothing written through it.
+    #[test]
+    fn tui_ancestor_links_are_refused() {
+        for planted in ["latest", "latest/tui"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (oc, own) = (tmp.path().join("host"), tmp.path().join("own/tui"));
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("tabs.json"), r#"{"secret":1}"#).unwrap();
+            std::fs::create_dir_all(oc.join(planted).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, oc.join(planted)).unwrap();
+            assert!(carry_in_tui(&oc, &own).is_empty(), "{planted}");
+            assert!(!own.join("tabs.json").exists(), "{planted}");
+            assert_eq!(
+                std::fs::read_to_string(elsewhere.join("tabs.json")).unwrap(),
+                r#"{"secret":1}"#
+            );
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+        }
+    }
+
+    /// The host dir is pinned at start: a link swapped in for it during the
+    /// session does not redirect the copy-back.
+    #[test]
+    fn tui_copy_back_ignores_a_swapped_host_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (oc, own) = (tmp.path().join("host"), tmp.path().join("own/tui"));
+        std::fs::create_dir_all(&oc).unwrap();
+        let carried = carry_in_tui(&oc, &own);
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("tabs.json"), r#"{"secret":1}"#).unwrap();
+        let host = oc.join(TUI_DIR);
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&host, &moved).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &host).unwrap();
+        std::fs::write(own.join("tabs.json"), r#"{"agent":1}"#).unwrap();
+        save_tui(&carried);
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("tabs.json")).unwrap(),
+            r#"{"secret":1}"#
+        );
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(moved.join("tabs.json")).unwrap(),
+            r#"{"agent":1}"#,
+            "written to the pinned dir"
+        );
     }
 
     /// The copy-back reads through the dir opened at prepare: a link swapped

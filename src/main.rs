@@ -5007,7 +5007,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if let Some((own, before)) = &v2_model {
         cplt::opencode_v2::save_model(own, &home_dir, before.as_deref());
     }
-    cplt::opencode_v2::save_tui(&v2_tui, &home_dir);
+    cplt::opencode_v2::save_tui(&v2_tui);
     if let Some(stores) = opencode_stores {
         stores.report(settled);
     }
