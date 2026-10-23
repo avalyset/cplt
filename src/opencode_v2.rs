@@ -1525,6 +1525,63 @@ mod tests {
         }
     }
 
+    /// A FIFO planted at a host TUI file is not carried in, does not hang
+    /// the launch, and is left in place at exit.
+    #[test]
+    fn tui_copy_in_refuses_a_fifo() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (oc, own) = (tmp.path().join("host"), tmp.path().join("own/tui"));
+        let host = oc.join(TUI_DIR);
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("highlights.json"), r#"{"seen":"1"}"#).unwrap();
+        mkfifo(&host.join("tabs.json"));
+        let (o, w) = (oc.clone(), own.clone());
+        let carried = bounded(move || carry_in_tui(&o, &w));
+        let names: Vec<_> = carried.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["highlights.json"], "the FIFO is not carried");
+        assert!(!own.join("tabs.json").exists());
+
+        std::fs::write(own.join("tabs.json"), r#"{"agent":1}"#).unwrap();
+        bounded(move || save_tui(&carried));
+        let kind = std::fs::symlink_metadata(host.join("tabs.json"))
+            .unwrap()
+            .file_type();
+        assert!(kind.is_fifo(), "the refused host FIFO is left alone");
+    }
+
+    /// A FIFO the agent leaves at a session TUI file is refused at exit
+    /// without hanging, and the host file is unchanged.
+    #[test]
+    fn tui_copy_back_refuses_a_fifo() {
+        use crate::untrusted::tests::{bounded, mkfifo};
+        let tmp = tempfile::tempdir().unwrap();
+        let (oc, own) = (tmp.path().join("host"), tmp.path().join("own/tui"));
+        let host = oc.join(TUI_DIR);
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("tabs.json"), r#"{"tabs":1}"#).unwrap();
+        let carried = carry_in_tui(&oc, &own);
+        let tabs = carried.into_iter().find(|c| c.name == "tabs.json").unwrap();
+        std::fs::remove_file(own.join("tabs.json")).unwrap();
+        mkfifo(&own.join("tabs.json"));
+        let res = bounded(move || {
+            save_file_at(
+                &tabs.dir,
+                &tabs.host,
+                tabs.name,
+                TUI_LIMIT,
+                tabs.before.as_deref(),
+            )
+        });
+        assert!(res.is_err(), "the FIFO is refused");
+        assert_eq!(
+            std::fs::read_to_string(host.join("tabs.json")).unwrap(),
+            r#"{"tabs":1}"#
+        );
+        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 1);
+    }
+
     /// The host dir is pinned at start: a link swapped in for it during the
     /// session does not redirect the copy-back.
     #[test]
