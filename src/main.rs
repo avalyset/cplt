@@ -689,6 +689,12 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_audit: bool,
 
+    /// Show the full sandbox configuration table and the full post-session
+    /// report. By default cplt prints the table only when it changed since the
+    /// last launch in this project, and a short report after the session.
+    #[arg(long)]
+    verbose: bool,
+
     // --- Copilot pass-through flags ---
     // These are forwarded directly to the copilot process for convenience,
     // avoiding the need for -- when using common session-level flags.
@@ -4867,6 +4873,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
+            cli.verbose || cli.print_profile || !resolved.yes,
         );
     } else if !unapproved_proposals.is_empty() {
         ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
@@ -6916,6 +6923,7 @@ fn run_exec_command(
             prepared.keychain_substitute(),
             &repo_rows,
             worktree_root.as_deref(),
+            cli.verbose || cli.print_profile || !resolved.yes,
         );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
