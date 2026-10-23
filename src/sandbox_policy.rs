@@ -48,7 +48,55 @@ pub const DENIED_DOTFILES: &[&str] = &[
 ];
 
 /// cplt's own state directory, relative to `$HOME`.
+///
+/// This is the default and the legacy location. With `XDG_CONFIG_HOME` set,
+/// state goes to `$XDG_CONFIG_HOME/cplt` instead ([`cplt_state_dir`]), and
+/// this directory stays denied, since older state may still be read from it.
 pub const CPLT_STATE_DIR: &str = ".config/cplt";
+
+/// cplt's state directory: `$XDG_CONFIG_HOME/cplt` when `XDG_CONFIG_HOME` is
+/// an absolute UTF-8 path, else `$HOME/.config/cplt` (#830).
+///
+/// A relative value is ignored, as the XDG spec asks. A non-UTF-8 one is too:
+/// the Seatbelt profile names this directory in a string, and a lossy
+/// spelling would deny the wrong path.
+#[must_use]
+pub fn cplt_state_dir(env: &CacheEnv, home: &Path) -> PathBuf {
+    env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.to_str().is_some())
+        .map_or_else(|| home.join(CPLT_STATE_DIR), |xdg| xdg.join("cplt"))
+}
+
+/// The state directory to use for the file `name`: [`cplt_state_dir`],
+/// unless `name` exists only under the legacy `$HOME/.config/cplt`.
+///
+/// State written before cplt honoured `XDG_CONFIG_HOME` is read, and updated,
+/// where it is. Nothing is moved.
+#[must_use]
+pub fn cplt_state_dir_for(env: &CacheEnv, home: &Path, name: &str) -> PathBuf {
+    let current = cplt_state_dir(env, home);
+    let legacy = home.join(CPLT_STATE_DIR);
+    if current != legacy && !current.join(name).exists() && legacy.join(name).exists() {
+        legacy
+    } else {
+        current
+    }
+}
+
+/// Every directory that can hold cplt state: [`cplt_state_dir`] and, when
+/// `XDG_CONFIG_HOME` moves it, the legacy `$HOME/.config/cplt`. All of them
+/// get the same protection as [`CPLT_STATE_DIR`].
+#[must_use]
+pub fn cplt_state_dirs(env: &CacheEnv, home: &Path) -> Vec<PathBuf> {
+    let current = cplt_state_dir(env, home);
+    let legacy = home.join(CPLT_STATE_DIR);
+    if current == legacy {
+        vec![legacy]
+    } else {
+        vec![current, legacy]
+    }
+}
 
 /// nav-pilot's state directory, relative to `$HOME`.
 pub const NAV_PILOT_STATE_DIR: &str = ".nav-pilot";
@@ -168,19 +216,25 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
 /// that can write any of them approves its own next launch, and the widening
 /// perpetuates itself.
 ///
-/// Both locations are checked: `$HOME/.config/cplt` and whatever `CPLT_CONFIG`
-/// relocates the directory to, since the override moves the real files.
+/// Every location is checked: `$HOME/.config/cplt`, `$XDG_CONFIG_HOME/cplt`
+/// ([`cplt_state_dirs`]), and whatever `CPLT_CONFIG` relocates the directory
+/// to, since the override moves the real files.
 /// The grant is resolved with [`config::canonicalize_deepest`] so a path that
 /// does not exist yet still matches — otherwise the check is sidestepped by
 /// naming a file before creating it — and the lexical form is compared too, so
 /// a symlink out of the directory is refused as well.
 #[must_use]
 pub fn cplt_state_dir_grant(home: &Path, path: &Path) -> Option<PathBuf> {
+    cplt_state_dir_grant_in(&process_env, home, path)
+}
+
+/// [`cplt_state_dir_grant`] with the environment passed in.
+fn cplt_state_dir_grant_in(env: &CacheEnv, home: &Path, path: &Path) -> Option<PathBuf> {
     let canon = resolver(home);
     let resolved = canon(path);
-    [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+    config::config_dir()
         .into_iter()
-        .flatten()
+        .chain(cplt_state_dirs(env, home))
         .find(|dir| resolved.starts_with(canon(dir)) || path.starts_with(dir))
 }
 
@@ -437,9 +491,9 @@ fn overlaps_credential_entry(home: &Path, target: &Path, own: &Path) -> bool {
         .iter()
         .chain(DENIED_FILES)
         .any(|d| overlaps(canon(&home.join(d))))
-        || [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+        || config::config_dir()
             .into_iter()
-            .flatten()
+            .chain(cplt_state_dirs(&process_env, home))
             .any(|dir| overlaps(canon(&dir)))
         || DENIED_HOME_SUBPATHS.iter().any(|f| {
             let named = home.join(f);
@@ -4499,6 +4553,90 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    fn xdg(value: impl Into<OsString>) -> impl Fn(&str) -> Option<OsString> {
+        let value = value.into();
+        move |name| (name == "XDG_CONFIG_HOME").then(|| value.clone())
+    }
+
+    /// #830: state follows `XDG_CONFIG_HOME` when it is an absolute path, and
+    /// is `~/.config/cplt` otherwise.
+    #[test]
+    fn state_dir_follows_xdg_config_home() {
+        let home = Path::new("/fake/user");
+        assert_eq!(
+            cplt_state_dir(&xdg("/elsewhere/config"), home),
+            Path::new("/elsewhere/config/cplt")
+        );
+        assert_eq!(
+            cplt_state_dirs(&xdg("/elsewhere/config"), home),
+            [
+                PathBuf::from("/elsewhere/config/cplt"),
+                PathBuf::from("/fake/user/.config/cplt")
+            ]
+        );
+    }
+
+    #[test]
+    fn state_dir_without_xdg_config_home_is_the_legacy_dir() {
+        let home = Path::new("/fake/user");
+        for env in [
+            &no_cache_env as &CacheEnv,
+            &xdg(""),
+            &xdg("relative/config"),
+        ] {
+            assert_eq!(cplt_state_dir(env, home), home.join(CPLT_STATE_DIR));
+            assert_eq!(cplt_state_dirs(env, home), [home.join(CPLT_STATE_DIR)]);
+        }
+        // The common case, XDG_CONFIG_HOME=$HOME/.config, is the same directory.
+        let same = |name: &str| (name == "XDG_CONFIG_HOME").then(|| "/fake/user/.config".into());
+        assert_eq!(cplt_state_dirs(&same, home), [home.join(CPLT_STATE_DIR)]);
+    }
+
+    /// State written to `~/.config/cplt` before #830 is still read there; new
+    /// state goes to the XDG directory; once both exist, the XDG one wins.
+    #[test]
+    fn state_file_in_the_legacy_dir_is_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let xdg_root = tmp.path().join("xdg");
+        let env = xdg(&xdg_root);
+        let legacy = home.join(CPLT_STATE_DIR);
+        let current = xdg_root.join("cplt");
+
+        assert_eq!(cplt_state_dir_for(&env, &home, "quiet-tip-shown"), current);
+
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("quiet-tip-shown"), "2").unwrap();
+        assert_eq!(cplt_state_dir_for(&env, &home, "quiet-tip-shown"), legacy);
+        assert_eq!(cplt_state_dir_for(&env, &home, "opencode-version"), current);
+
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("quiet-tip-shown"), "3").unwrap();
+        assert_eq!(cplt_state_dir_for(&env, &home, "quiet-tip-shown"), current);
+    }
+
+    /// A grant into the XDG state directory is refused like one into
+    /// `~/.config/cplt`, which stays refused.
+    #[test]
+    fn grants_into_either_state_dir_are_refused() {
+        let home = Path::new("/fake/user");
+        let env = xdg("/elsewhere/config");
+        for path in [
+            "/elsewhere/config/cplt/trust",
+            "/fake/user/.config/cplt/trust",
+        ] {
+            assert!(
+                cplt_state_dir_grant_in(&env, home, Path::new(path)).is_some(),
+                "{path}"
+            );
+        }
+        assert!(cplt_state_dir_grant_in(&env, home, Path::new("/elsewhere/config/gh")).is_none());
+        assert!(
+            cplt_state_dir_grant_in(&no_cache_env, home, Path::new("/elsewhere/config/cplt"))
+                .is_none()
+        );
+    }
+
     /// `--allow-rootless-docker` (#782) lifts the runtime-dir sockets only;
     /// every rootful, Desktop and colima mask stays. Off and All are unchanged.
     #[test]

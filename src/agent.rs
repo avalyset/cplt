@@ -226,7 +226,8 @@ fn opencode_v2_within(
     home: &Path,
     mut probe: impl FnMut(&Path, std::time::Duration) -> crate::discover::VersionProbe,
 ) -> Option<bool> {
-    let cache_dir = &home.join(crate::sandbox::CPLT_STATE_DIR);
+    let cache_dir =
+        &crate::sandbox::cplt_state_dir_for(&crate::sandbox::process_env, home, "opencode-version");
     let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
     let parts: Vec<String> = real
         .components()

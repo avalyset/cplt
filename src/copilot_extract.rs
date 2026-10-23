@@ -4,7 +4,7 @@
 //! into the platform cache on first run. The sandbox denies writes to that cache,
 //! so `cplt` has to force the extraction before entering it (#166).
 
-use cplt::sandbox::{CPLT_STATE_DIR, CacheEnv, copilot_pkg_dir, process_env};
+use cplt::sandbox::{CacheEnv, copilot_pkg_dir, cplt_state_dir_for, process_env};
 use cplt::ui;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn copilot_cache_dirs(
     };
     Ok((
         copilot_pkg_dir(env, home, std::env::consts::OS)?.join(format!("{platform}-{arch}")),
-        home.join(CPLT_STATE_DIR),
+        cplt_state_dir_for(env, home, "copilot-extracted"),
     ))
 }
 
@@ -823,6 +823,7 @@ fn find_complete_dir_for_version(pkg_base: &Path, version: &str) -> Option<Strin
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod copilot_extraction_tests {
     use super::*;
+    use cplt::sandbox::CPLT_STATE_DIR;
 
     /// #374: the directory the preflight polls follows Copilot's cache
     /// variables; cplt's own marker directory does not move with them.
