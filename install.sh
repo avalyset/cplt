@@ -4,19 +4,22 @@ set -euo pipefail
 # cplt installer — installs the cplt sandbox wrapper.
 #
 # On macOS: uses Homebrew (brew install navikt/tap/cplt) when available.
-# On Linux / CI: downloads the latest release binary from GitHub.
+# On Debian / Ubuntu: adds the Nav apt archive and installs from it.
+# Elsewhere, or with --no-apt: downloads the latest release binary from GitHub.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
 #   curl -fsSL ... | bash -s -- --version 2026.05.05-174753-75bae5b
 #   curl -fsSL ... | bash -s -- --dir /usr/local/bin
 #   curl -fsSL ... | bash -s -- --no-brew
+#   curl -fsSL ... | bash -s -- --no-apt
 
 REPO="navikt/cplt"
 BINARY="cplt"
 VERSION=""
 INSTALL_DIR=""
 NO_BREW=false
+NO_APT=false
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 
@@ -30,12 +33,15 @@ while [[ $# -gt 0 ]]; do
       INSTALL_DIR="$2"; shift 2 ;;
     --no-brew)
       NO_BREW=true; shift ;;
+    --no-apt)
+      NO_APT=true; shift ;;
     --help|-h)
-      echo "Usage: install.sh [--version <tag>] [--dir <path>] [--no-brew]"
+      echo "Usage: install.sh [--version <tag>] [--dir <path>] [--no-brew] [--no-apt]"
       echo ""
       echo "  --version  Install a specific version (default: latest release)"
       echo "  --dir      Install directory (default: auto-detect from PATH)"
       echo "  --no-brew  Skip Homebrew even if available (use direct download)"
+      echo "  --no-apt   Skip the apt archive on Debian/Ubuntu (use direct download)"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -57,6 +63,38 @@ if [[ "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v
   echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"
   echo ""
   echo "Upgrade later with: brew upgrade cplt"
+  exit 0
+fi
+
+# ─── apt archive (Debian / Ubuntu) ───────────────────────────────────────────
+# A bare binary gets no upgrades from apt, so on apt systems add the archive and
+# install from it. An existing script install outside /usr/bin keeps the direct
+# download: switching it to apt would leave two copies on PATH.
+
+EXISTING="$(command -v "$BINARY" 2>/dev/null || true)"
+if [[ "$NO_APT" == false && -z "$VERSION" && -z "$INSTALL_DIR" && "$(uname -s)" == Linux ]] \
+  && command -v apt-get &>/dev/null && command -v sudo &>/dev/null \
+  && [[ -z "$EXISTING" || "$EXISTING" == /usr/bin/cplt ]]; then
+  KEYRING=/usr/share/keyrings/navikt-archive-keyring.gpg
+  echo "→ Adding the Nav apt archive (https://navikt.github.io/apt)..."
+  KEY_TMP="$(mktemp)"
+  curl -fsSL -o "$KEY_TMP" https://navikt.github.io/apt/keyring/navikt-archive-keyring.gpg
+  test -s "$KEY_TMP"
+  sudo install -m 644 "$KEY_TMP" "$KEYRING"
+  rm -f "$KEY_TMP"
+  echo "deb [signed-by=${KEYRING}] https://navikt.github.io/apt stable main" \
+    | sudo tee /etc/apt/sources.list.d/navikt.list >/dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y cplt
+  echo ""
+  echo "✓ cplt is ready! ($(cplt --version 2>/dev/null || echo unknown))"
+  echo ""
+  echo "Get started:"
+  echo "  cplt doctor             # Check your environment"
+  echo "  cplt --shell-install      # Make 'copilot' use the sandboxed version"
+  echo "  cplt -- -p \"fix the tests\"  # Run Copilot in sandbox"
+  echo ""
+  echo "Upgrade later with: sudo apt update && sudo apt install --only-upgrade cplt"
   exit 0
 fi
 
