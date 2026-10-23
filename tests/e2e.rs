@@ -330,10 +330,8 @@ mod e2e_tests {
     /// (as an empty directory, which OpenCode then fails to read).
     #[test]
     fn e2e_opencode_print_profile_creates_no_config_files() {
-        let tmp = tempfile::Builder::new()
-            .prefix(".cplt-ocpp-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("tempdir");
+        // Outside the project: cplt refuses a state dir moved into it (#830).
+        let tmp = tempfile::tempdir().expect("tempdir");
         let xdg = tmp.path().join("xdg");
         let output = cplt_cmd()
             .args(["--print-profile", "--agent", "opencode"])

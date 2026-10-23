@@ -1054,6 +1054,39 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
+    validate_state_dir_outside_grants(config)
+}
+
+/// Refuse a launch whose cplt state directory lies inside a tree the sandbox
+/// grants: the project, a named root, or an `allow.read`/`allow.write` path.
+///
+/// `XDG_CONFIG_HOME` moves the state directory (#830). Pointed into the
+/// project, it would put the trust store inside a writable tree, and Landlock
+/// has no deny to stop that grant. Seatbelt's deny would hold, but one rule
+/// on both platforms is easier to reason about.
+fn validate_state_dir_outside_grants(config: &SandboxConfig) -> Result<(), String> {
+    let canon = crate::config::canonicalize_deepest;
+    let legacy = config.home_dir.join(policy::CPLT_STATE_DIR);
+    let trees = std::iter::once(config.project_dir)
+        .chain(config.named_roots.iter().map(PathBuf::as_path))
+        .chain(config.extra_read.iter().map(PathBuf::as_path))
+        .chain(config.extra_write.iter().map(PathBuf::as_path));
+    for tree in trees {
+        let tree_canon = canon(tree);
+        // Only the moved directory: the legacy one predates #830 and its
+        // overlaps are refused per grant already.
+        for dir in policy::cplt_state_dirs(config.copilot_cache_env, config.home_dir) {
+            if dir != legacy && (canon(&dir).starts_with(&tree_canon) || dir.starts_with(tree)) {
+                return Err(format!(
+                    "cplt's state directory {} is inside {}, which the sandbox can \
+                     reach. It holds the trust store and config that decide what the \
+                     next launch allows. Point XDG_CONFIG_HOME outside it, or unset it.",
+                    dir.display(),
+                    tree.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5422,6 +5455,19 @@ mod tests {
     /// them is self-perpetuating. Refused as a subtree, on every grant key,
     /// including a path that does not exist yet (naming a file before creating
     /// it would otherwise walk straight through a canonicalize-only check).
+    /// #830: `XDG_CONFIG_HOME` inside the project would put cplt's state in a
+    /// tree the agent can write. The launch is refused instead.
+    #[test]
+    fn prepare_rejects_a_state_dir_moved_into_the_project() {
+        let home = Path::new("/fake/test");
+        let mut config = test_config(home, &[]);
+        let xdg = config.project_dir.join(".config").into_os_string();
+        let env = move |name: &str| (name == "XDG_CONFIG_HOME").then(|| xdg.clone());
+        config.copilot_cache_env = &env;
+        let error = prepare(&config).err().expect("must be refused");
+        assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
+    }
+
     #[test]
     fn prepare_rejects_a_grant_inside_the_cplt_state_directory() {
         let home = Path::new("/fake/test");
