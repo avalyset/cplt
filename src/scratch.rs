@@ -732,7 +732,9 @@ fn gc_stale_session_dirs(base: &Path) {
             if metadata.uid() != unsafe { libc::getuid() } {
                 continue;
             }
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            if let Ok(dir) = open_dir_nofollow(&path) {
+                let _ = dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
             if let Err(e) = remove_tree(&path) {
                 ui::warn(&format!(
                     "Warning: cannot remove stale scratch dir {}: {e}",
@@ -1077,22 +1079,60 @@ fn remove_tree(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Never follows symlinks: each dir is opened `O_NOFOLLOW|O_DIRECTORY` and
-/// chmodded through that descriptor, so a swapped-in symlink is skipped.
+/// Never follows symlinks at any depth: the walk is fd-relative. Each child
+/// is opened with `openat(parent, name, O_DIRECTORY|O_NOFOLLOW)`, listed
+/// through `fdopendir` and chmodded with `fchmod`, so swapping any dir in the
+/// tree for a symlink cannot steer the walk outside the scratch dir.
 fn make_subdirs_removable(dir: &Path) {
+    if let Ok(top) = open_dir_nofollow(dir) {
+        chmod_subdirs_at(&top);
+    }
+}
+
+fn chmod_subdirs_at(dir: &std::fs::File) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // fdopendir takes ownership of the fd it gets, so hand it a dup.
+    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup < 0 {
         return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file) = open_dir_nofollow(&path) else {
-            continue;
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        unsafe { libc::close(dup) };
+        return;
+    }
+    let mut names = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+
+    for name in names {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
-        if let Ok(meta) = file.metadata() {
+        if fd < 0 {
+            continue; // not a dir, a symlink, or unreadable
+        }
+        // SAFETY: `fd` is a fresh descriptor this File now owns.
+        let child = unsafe { std::fs::File::from_raw_fd(fd) };
+        if let Ok(meta) = child.metadata() {
             let mode = meta.permissions().mode() | 0o700;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
-            make_subdirs_removable(&path);
+            let _ = child.set_permissions(std::fs::Permissions::from_mode(mode));
+            chmod_subdirs_at(&child);
         }
     }
 }
