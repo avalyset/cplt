@@ -1923,7 +1923,8 @@ fn warn_worktrees_not_audited(
             details.join("\n    ")
         ));
     }
-    if let (true, Some(root)) = (audit_enabled, worktree_root) {
+    // Detail tier: the table already names the worktree root as persisting.
+    if let (true, Some(root)) = (audit_enabled && ui::verbose(), worktree_root) {
         ui::warn(&format!(
             "The audit above does not cover worktrees under {}. Review them there \
              (`git worktree list` from this repository).",
@@ -3302,10 +3303,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&untrusted_repo_config_notice(unapproved_proposals.len()));
         for key in &unapproved_proposals {
-            // Act-now, but short: the values are behind --verbose and `cplt trust`.
-            let detail = repo_config::propose_key_detail(&repo_propose, key, Some(5))
-                .filter(|_| ui::verbose());
-            match detail {
+            match repo_config::propose_key_detail(&repo_propose, key, Some(5)) {
                 Some(detail) => eprintln!(
                     "  {}○{} {key}: {detail}",
                     ui::color(ui::YELLOW),

@@ -1564,8 +1564,15 @@ impl Resolved {
         out!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
         out!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 
+        // The proxy line carries this run's ephemeral port; leave it out of
+        // the comparison or every launch reads as changed.
+        let stable: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|l| !l.contains("Proxy:"))
+            .collect();
         let changed =
-            crate::launch_state::changed(home_dir, project_dir, "summary", &lines.join("\n"));
+            crate::launch_state::changed(home_dir, project_dir, "summary", &stable.join("\n"));
         if full || changed {
             for line in &lines {
                 eprintln!("{line}");
