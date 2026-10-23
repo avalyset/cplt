@@ -3529,27 +3529,30 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opencode_v2_probe_is_cached() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("opencode");
-        let count = dir.path().join("count");
-        std::fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
-                count.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let home = dir.path().join("home");
-        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
-        assert_eq!(is_opencode_v2(&bin, &home), Some(true));
-        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
-        // The verdict must sit where the sandbox denies the agent writes.
-        let state = home.join(crate::sandbox::CPLT_STATE_DIR);
-        assert!(state.join("opencode-version").exists());
-        assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+        // Unset so the state lands in the temp home, not the real XDG dir.
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("opencode");
+            let count = dir.path().join("count");
+            std::fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\necho x >> {}\necho opencode v2.0.24\n",
+                    count.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let home = dir.path().join("home");
+            assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+            assert_eq!(is_opencode_v2(&bin, &home), Some(true));
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+            // The verdict must sit where the sandbox denies the agent writes.
+            let state = home.join(crate::sandbox::CPLT_STATE_DIR);
+            assert!(state.join("opencode-version").exists());
+            assert!(crate::sandbox::DENIED_DOTFILES.contains(&crate::sandbox::CPLT_STATE_DIR));
+        });
     }
 
     /// #725: a probe with no usable answer is retried once, never cached, and

@@ -2726,6 +2726,13 @@ fn emit_deny_rules(sb: &mut String, config: &SandboxConfig, home: &str) {
             .chain(&files)
             .filter_map(|s| s.get(1).map(PathBuf::from)),
     );
+    // The moved state dir is pinned whether or not it is a link: under a
+    // writable tree its ancestors could be renamed around the deny.
+    targets.extend(
+        moved_state
+            .iter()
+            .map(|d| crate::config::canonicalize_deepest(Path::new(d))),
+    );
     emit_resolved_deny_pins(sb, config, &targets);
     for path in config.extra_deny {
         let p = path.to_string_lossy();

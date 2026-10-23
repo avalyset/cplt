@@ -59,13 +59,38 @@ pub const CPLT_STATE_DIR: &str = ".config/cplt";
 ///
 /// A relative value is ignored, as the XDG spec asks. A non-UTF-8 one is too:
 /// the Seatbelt profile names this directory in a string, and a lossy
-/// spelling would deny the wrong path.
+/// spelling would deny the wrong path. A path with a character the Seatbelt
+/// profile cannot hold ([`validate_sbpl_path`]) is ignored for the same reason.
+///
+/// The XDG location is skipped, for the rest of the process, once
+/// [`pin_legacy_state_dir`] has been called, and whenever it lies inside the
+/// current directory (usually the project): there the sandbox could write it.
 #[must_use]
 pub fn cplt_state_dir(env: &CacheEnv, home: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    xdg_state_dir(env)
+        .filter(|_| !LEGACY_STATE_PINNED.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|dir| cwd.as_ref().is_none_or(|cwd| !dir.starts_with(cwd)))
+        .unwrap_or_else(|| home.join(CPLT_STATE_DIR))
+}
+
+/// `$XDG_CONFIG_HOME/cplt` when that is a usable location, before the
+/// sandbox-grant checks in [`cplt_state_dir`].
+#[must_use]
+pub fn xdg_state_dir(env: &CacheEnv) -> Option<PathBuf> {
     env("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.to_str().is_some())
-        .map_or_else(|| home.join(CPLT_STATE_DIR), |xdg| xdg.join("cplt"))
+        .filter(|p| p.is_absolute() && p.to_str().is_some() && validate_sbpl_path(p).is_ok())
+        .map(|xdg| xdg.join("cplt"))
+}
+
+static LEGACY_STATE_PINNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Keep state in `$HOME/.config/cplt` for the rest of this process: the XDG
+/// location falls inside a sandbox grant (#830).
+pub fn pin_legacy_state_dir() {
+    LEGACY_STATE_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The state directory to use for the file `name`: [`cplt_state_dir`],

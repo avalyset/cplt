@@ -568,6 +568,7 @@ pub fn prepare_with_pnpm_shadow(
 ) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
+    keep_state_out_of_grants(config);
     validate_pnpm_tool_dirs(config)?;
     // One policy for every check below and the bubblewrap plan, generated on
     // first use: generating can warn, and a warning should print once (#602).
@@ -1054,40 +1055,47 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             validate_grant_path(key, p, config.home_dir)?;
         }
     }
-    validate_state_dir_outside_grants(config)
+    Ok(())
 }
 
-/// Refuse a launch whose cplt state directory lies inside a tree the sandbox
-/// grants: the project, a named root, or an `allow.read`/`allow.write` path.
+/// The moved cplt state directory and the granted tree it lies inside, if
+/// any: the project, a named root, or an `allow.read`/`allow.write` path.
 ///
-/// `XDG_CONFIG_HOME` moves the state directory (#830). Pointed into the
-/// project, it would put the trust store inside a writable tree, and Landlock
-/// has no deny to stop that grant. Seatbelt's deny would hold, but one rule
-/// on both platforms is easier to reason about.
-fn validate_state_dir_outside_grants(config: &SandboxConfig) -> Result<(), String> {
+/// `XDG_CONFIG_HOME` moves the state directory (#830). Inside a grant, the
+/// agent could read or write the trust store, and Landlock has no deny to
+/// stop it. The legacy directory is not checked: its overlaps are refused per
+/// grant already.
+fn state_dir_in_grant(config: &SandboxConfig) -> Option<(PathBuf, PathBuf)> {
     let canon = crate::config::canonicalize_deepest;
-    let legacy = config.home_dir.join(policy::CPLT_STATE_DIR);
-    let trees = std::iter::once(config.project_dir)
-        .chain(config.named_roots.iter().map(PathBuf::as_path))
-        .chain(config.extra_read.iter().map(PathBuf::as_path))
-        .chain(config.extra_write.iter().map(PathBuf::as_path));
-    for tree in trees {
-        let tree_canon = canon(tree);
-        // Only the moved directory: the legacy one predates #830 and its
-        // overlaps are refused per grant already.
-        for dir in policy::cplt_state_dirs(config.copilot_cache_env, config.home_dir) {
-            if dir != legacy && (canon(&dir).starts_with(&tree_canon) || dir.starts_with(tree)) {
-                return Err(format!(
-                    "cplt's state directory {} is inside {}, which the sandbox can \
-                     reach. It holds the trust store and config that decide what the \
-                     next launch allows. Point XDG_CONFIG_HOME outside it, or unset it.",
-                    dir.display(),
-                    tree.display()
-                ));
-            }
-        }
+    let dir = policy::xdg_state_dir(config.copilot_cache_env)?;
+    if dir == config.home_dir.join(policy::CPLT_STATE_DIR) {
+        return None;
     }
-    Ok(())
+    // Every writable tree (project, named roots, allow.write, worktrees,
+    // scratch, caches), plus the read grants. An ancestor inside a writable
+    // tree could also be renamed around the deny, so inside means inside.
+    let resolved = canon(&dir);
+    canonical_writable_trees(config)
+        .into_iter()
+        .map(|(t, _)| t)
+        .chain(config.named_roots.iter().map(|t| canon(t)))
+        .chain(config.extra_read.iter().map(|t| canon(t)))
+        .find(|tree| resolved.starts_with(tree) || dir.starts_with(tree))
+        .map(|tree| (dir.clone(), tree))
+}
+
+/// Keep state in the legacy, always-denied `~/.config/cplt` for this launch
+/// when the XDG location is inside a grant, and say so once.
+fn keep_state_out_of_grants(config: &SandboxConfig) {
+    if let Some((dir, tree)) = state_dir_in_grant(config) {
+        policy::pin_legacy_state_dir();
+        crate::ui::warn(&format!(
+            "cplt state stays in ~/.config/cplt: {} is inside the sandbox's grant on {}. \
+             Point XDG_CONFIG_HOME elsewhere to move it.",
+            dir.display(),
+            tree.display()
+        ));
+    }
 }
 
 /// Refuse one grant that no launch can honour, with the reason.
@@ -5455,17 +5463,24 @@ mod tests {
     /// them is self-perpetuating. Refused as a subtree, on every grant key,
     /// including a path that does not exist yet (naming a file before creating
     /// it would otherwise walk straight through a canonicalize-only check).
-    /// #830: `XDG_CONFIG_HOME` inside the project would put cplt's state in a
-    /// tree the agent can write. The launch is refused instead.
+    /// #830: an `XDG_CONFIG_HOME` inside a grant is detected, so the launch
+    /// keeps state in the always-denied `~/.config/cplt`.
     #[test]
-    fn prepare_rejects_a_state_dir_moved_into_the_project() {
+    fn state_dir_inside_a_grant_is_detected() {
         let home = Path::new("/fake/test");
+        let granted = vec![PathBuf::from("/granted/tree")];
         let mut config = test_config(home, &[]);
-        let xdg = config.project_dir.join(".config").into_os_string();
-        let env = move |name: &str| (name == "XDG_CONFIG_HOME").then(|| xdg.clone());
+        config.extra_write = &granted;
+        let env = |name: &str| {
+            (name == "XDG_CONFIG_HOME").then(|| std::ffi::OsString::from("/granted/tree/cfg"))
+        };
         config.copilot_cache_env = &env;
-        let error = prepare(&config).err().expect("must be refused");
-        assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
+        assert_eq!(
+            state_dir_in_grant(&config),
+            Some((PathBuf::from("/granted/tree/cfg/cplt"), granted[0].clone()))
+        );
+        config.extra_write = &[];
+        assert_eq!(state_dir_in_grant(&config), None);
     }
 
     #[test]

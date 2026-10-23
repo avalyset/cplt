@@ -330,8 +330,11 @@ mod e2e_tests {
     /// (as an empty directory, which OpenCode then fails to read).
     #[test]
     fn e2e_opencode_print_profile_creates_no_config_files() {
-        // Outside the project: cplt refuses a state dir moved into it (#830).
-        let tmp = tempfile::tempdir().expect("tempdir");
+        // Inside the project on purpose: state then stays in ~/.config/cplt (#830).
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-ocpp-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir");
         let xdg = tmp.path().join("xdg");
         let output = cplt_cmd()
             .args(["--print-profile", "--agent", "opencode"])
@@ -344,6 +347,12 @@ mod e2e_tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cplt state stays in ~/.config/cplt"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!xdg.join("cplt").exists(), "no state inside the project");
         for f in ["opencode.json", "opencode.jsonc", "config.json"] {
             let p = xdg.join("opencode").join(f);
             assert!(!p.exists(), "{} must not be created", p.display());
